@@ -34,6 +34,7 @@ struct PerplexityScorerOptions {
   string model_path;
   int max_length = 1024;
   int batch_size = 32;
+  int cache_size = 128;
   int gpu_layers = 0;
   double unknown_token_penalty = 0.0;
 };

@@ -102,6 +102,7 @@ static std::unique_ptr<PerplexityScorer> CreateScorer(Config* config,
   }
   config->GetInt(ns + "/max_length", &options.max_length);
   config->GetInt(ns + "/batch_size", &options.batch_size);
+  config->GetInt(ns + "/cache_size", &options.cache_size);
   string device = "cpu";
   config->GetString(ns + "/device", &device);
   options.gpu_layers = GpuLayersForDevice(device);

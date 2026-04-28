@@ -38,7 +38,9 @@ static double LogSoftmaxAt(const float* logits,
 class LlamaCausalScorer : public PerplexityScorer {
  public:
   explicit LlamaCausalScorer(const PerplexityScorerOptions& options)
-      : unknown_token_penalty_(std::max(0.0, options.unknown_token_penalty)) {
+      : max_parallel_(std::max(1, options.batch_size)),
+        prefix_cache_capacity_(std::max(0, options.cache_size)),
+        unknown_token_penalty_(std::max(0.0, options.unknown_token_penalty)) {
     ggml_backend_load_all();
 
     llama_model_params model_params = llama_model_default_params();
@@ -56,9 +58,10 @@ class LlamaCausalScorer : public PerplexityScorer {
 
     llama_context_params context_params = llama_context_default_params();
     context_params.n_ctx = std::max(256, options.max_length);
+    n_ctx_ = context_params.n_ctx;
     context_params.n_batch = std::max(64, options.max_length);
     context_params.n_ubatch = context_params.n_batch;
-    context_params.n_seq_max = std::max(1, options.batch_size);
+    context_params.n_seq_max = max_parallel_ + prefix_cache_capacity_;
     context_params.kv_unified = true;
     context_params.no_perf = true;
 
@@ -69,9 +72,11 @@ class LlamaCausalScorer : public PerplexityScorer {
       model_ = nullptr;
       return;
     }
+    ResetSeqIds();
     LOG(INFO) << "perplexity: loaded causal LM: " << options.model_path
               << ", gpu_layers=" << options.gpu_layers
-              << ", batch_size=" << options.batch_size
+              << ", batch_size=" << max_parallel_
+              << ", cache_size=" << prefix_cache_capacity_
               << ", max_length=" << options.max_length;
   }
 
@@ -99,12 +104,46 @@ class LlamaCausalScorer : public PerplexityScorer {
       }
     }
     ScoreDirect(tokenized, &scores);
+    LOG(INFO) << "perplexity: causal_cache hits=" << last_cache_hits_ << "/"
+              << last_cache_lookups_
+              << " avg_matched_len=" << last_avg_matched_len_;
     return scores;
   }
 
  private:
+  struct CachedPrefix {
+    vector<llama_token> tokens;
+    vector<double> prefix_logprob_sums;
+    llama_seq_id seq_id = -1;
+    int length = 0;
+    double logprob_sum = 0.0;
+    int token_count = 0;
+    int64_t last_used = 0;
+  };
+
+  struct PrefixMatch {
+    int cache_index = -1;
+    int matched_len = 0;
+  };
+
+  struct ScorePlan {
+    size_t candidate_index = 0;
+    const vector<llama_token>* tokens = nullptr;
+    llama_seq_id seq_id = -1;
+    int cache_index = -1;
+    int matched_len = 0;
+    int decode_start = 0;
+    double cached_logprob_sum = 0.0;
+    int cached_token_count = 0;
+    vector<double> cached_prefix_sums;
+    double suffix_logprob_sum = 0.0;
+    int suffix_token_count = 0;
+    bool full_cache_hit = false;
+  };
+
   void ScoreDirect(const vector<vector<llama_token>>& tokenized,
                    vector<PerplexityScore>* scores) {
+    ResetCacheStats();
     size_t start = 0;
     while (start < tokenized.size()) {
       if (tokenized[start].empty()) {
@@ -116,7 +155,7 @@ class LlamaCausalScorer : public PerplexityScorer {
       size_t end = start;
       const int max_tokens =
           std::max(1, static_cast<int>(llama_n_batch(context_)));
-      const size_t max_seqs = std::max<uint32_t>(1, llama_n_seq_max(context_));
+      const size_t max_seqs = static_cast<size_t>(max_parallel_);
       while (end < tokenized.size() && end - start < max_seqs) {
         if (tokenized[end].empty()) {
           ++end;
@@ -154,6 +193,9 @@ class LlamaCausalScorer : public PerplexityScorer {
   }
 
   double ScoreTokens(const vector<llama_token>& tokens) {
+    if (prefix_cache_capacity_ > 0)
+      return ScoreTokensWithCache(tokens);
+
     llama_memory_clear(llama_get_memory(context_), true);
 
     llama_batch batch = llama_batch_init(tokens.size(), 0, 1);
@@ -188,6 +230,11 @@ class LlamaCausalScorer : public PerplexityScorer {
                        size_t start,
                        size_t end,
                        vector<PerplexityScore>* scores) {
+    if (prefix_cache_capacity_ > 0) {
+      ScoreTokenBatchWithCache(tokenized, start, end, scores);
+      return;
+    }
+
     llama_memory_clear(llama_get_memory(context_), true);
 
     int total_tokens = 0;
@@ -239,6 +286,302 @@ class LlamaCausalScorer : public PerplexityScorer {
           count > 0 ? sum / count : -std::numeric_limits<double>::infinity();
     }
     llama_batch_free(batch);
+  }
+
+  double ScoreTokensWithCache(const vector<llama_token>& tokens) {
+    vector<vector<llama_token>> single{tokens};
+    vector<PerplexityScore> scores(1);
+    ScoreTokenBatchWithCache(single, 0, 1, &scores);
+    return scores[0].average_logprob;
+  }
+
+  void ScoreTokenBatchWithCache(const vector<vector<llama_token>>& tokenized,
+                                size_t start,
+                                size_t end,
+                                vector<PerplexityScore>* scores) {
+    vector<ScorePlan> plans;
+    plans.reserve(end - start);
+    int total_decode_tokens = 0;
+
+    for (size_t i = start; i < end; ++i) {
+      const auto& tokens = tokenized[i];
+      if (tokens.empty())
+        continue;
+      ScorePlan plan;
+      plan.candidate_index = i;
+      plan.tokens = &tokens;
+
+      PrefixMatch match = FindLongestPrefix(tokens);
+      RecordCacheLookup(match.matched_len);
+      if (match.cache_index >= 0) {
+        TouchPrefix(match.cache_index);
+        plan.cache_index = match.cache_index;
+        plan.matched_len = match.matched_len;
+        if (plan.matched_len == static_cast<int>(tokens.size())) {
+          const auto& cached = prefix_cache_[match.cache_index];
+          (*scores)[i].average_logprob =
+              cached.token_count > 0
+                  ? cached.logprob_sum / cached.token_count
+                  : -std::numeric_limits<double>::infinity();
+          plan.full_cache_hit = true;
+          plans.push_back(plan);
+          continue;
+        }
+
+        const auto& cached = prefix_cache_[match.cache_index];
+        plan.decode_start = std::max(0, plan.matched_len - 1);
+        plan.cached_logprob_sum =
+            PrefixLogprobSum(cached, static_cast<size_t>(plan.matched_len));
+        plan.cached_token_count = std::max(0, plan.matched_len - 1);
+        plan.cached_prefix_sums = cached.prefix_logprob_sums;
+        plan.seq_id = AllocSeqId();
+        if (plan.decode_start > 0) {
+          llama_memory_seq_cp(llama_get_memory(context_), cached.seq_id,
+                              plan.seq_id, 0, plan.decode_start);
+        }
+      } else {
+        plan.decode_start = 0;
+        plan.seq_id = AllocSeqId();
+      }
+      if (plan.seq_id < 0) {
+        (*scores)[i].average_logprob = ScoreTokensWithoutCache(tokens);
+        continue;
+      }
+
+      total_decode_tokens +=
+          static_cast<int>(tokens.size()) - plan.decode_start;
+      plans.push_back(plan);
+    }
+
+    if (total_decode_tokens <= 0)
+      return;
+    EvictUntilTokenCapacity(total_decode_tokens);
+
+    llama_batch batch = llama_batch_init(total_decode_tokens, 0, 1);
+    int token_pos = 0;
+    for (const auto& plan : plans) {
+      if (plan.full_cache_hit)
+        continue;
+      const auto& tokens = *plan.tokens;
+      for (size_t j = static_cast<size_t>(plan.decode_start);
+           j < tokens.size(); ++j) {
+        batch.token[token_pos] = tokens[j];
+        batch.pos[token_pos] = static_cast<llama_pos>(j);
+        batch.n_seq_id[token_pos] = 1;
+        batch.seq_id[token_pos][0] = plan.seq_id;
+        batch.logits[token_pos] = j + 1 < tokens.size();
+        ++token_pos;
+      }
+    }
+    batch.n_tokens = token_pos;
+
+    if (llama_decode(context_, batch) != 0) {
+      llama_batch_free(batch);
+      for (const auto& plan : plans) {
+        if (plan.full_cache_hit)
+          continue;
+        llama_memory_seq_rm(llama_get_memory(context_), plan.seq_id, -1, -1);
+        (*scores)[plan.candidate_index].average_logprob =
+            ScoreTokensWithoutCache(*plan.tokens);
+      }
+      return;
+    }
+
+    const float* logits = llama_get_logits(context_);
+    int logits_pos = 0;
+    for (auto& plan : plans) {
+      if (plan.full_cache_hit)
+        continue;
+      const auto& tokens = *plan.tokens;
+      vector<double> prefix_sums(tokens.size() + 1, 0.0);
+      if (!plan.cached_prefix_sums.empty()) {
+        const size_t copy_len =
+            std::min(prefix_sums.size(), plan.cached_prefix_sums.size());
+        for (size_t i = 0; i < copy_len; ++i)
+          prefix_sums[i] = plan.cached_prefix_sums[i];
+      }
+      for (size_t j = static_cast<size_t>(plan.decode_start);
+           j + 1 < tokens.size(); ++j) {
+        const double logprob =
+            LogSoftmaxAt(logits + static_cast<size_t>(logits_pos) * n_vocab_,
+                         n_vocab_, tokens[j + 1]) -
+            TokenPenalty(tokens[j + 1]);
+        plan.suffix_logprob_sum += logprob;
+        ++plan.suffix_token_count;
+        prefix_sums[j + 2] = prefix_sums[j + 1] + logprob;
+        ++logits_pos;
+      }
+      const double total_sum =
+          plan.cached_logprob_sum + plan.suffix_logprob_sum;
+      const int total_count = plan.cached_token_count + plan.suffix_token_count;
+      (*scores)[plan.candidate_index].average_logprob =
+          total_count > 0 ? total_sum / total_count
+                          : -std::numeric_limits<double>::infinity();
+      InsertOrReplacePrefix(plan.seq_id, tokens, std::move(prefix_sums),
+                            total_sum, total_count);
+    }
+    llama_batch_free(batch);
+  }
+
+  double ScoreTokensWithoutCache(const vector<llama_token>& tokens) {
+    const int saved_capacity = prefix_cache_capacity_;
+    prefix_cache_capacity_ = 0;
+    const double score = ScoreTokens(tokens);
+    llama_memory_clear(llama_get_memory(context_), true);
+    prefix_cache_.clear();
+    ResetSeqIds();
+    prefix_cache_capacity_ = saved_capacity;
+    return score;
+  }
+
+  PrefixMatch FindLongestPrefix(const vector<llama_token>& tokens) const {
+    PrefixMatch best;
+    for (size_t i = 0; i < prefix_cache_.size(); ++i) {
+      const auto& cached = prefix_cache_[i];
+      const size_t limit = std::min(tokens.size(), cached.tokens.size());
+      size_t len = 0;
+      while (len < limit && tokens[len] == cached.tokens[len])
+        ++len;
+      if (len > static_cast<size_t>(best.matched_len)) {
+        best.cache_index = static_cast<int>(i);
+        best.matched_len = static_cast<int>(len);
+      }
+    }
+    if (best.matched_len < 2) {
+      best.cache_index = -1;
+      best.matched_len = 0;
+    }
+    return best;
+  }
+
+  void TouchPrefix(int cache_index) {
+    if (cache_index < 0 ||
+        static_cast<size_t>(cache_index) >= prefix_cache_.size()) {
+      return;
+    }
+    prefix_cache_[cache_index].last_used = ++access_counter_;
+  }
+
+  void EvictLRUIfNeeded() {
+    if (prefix_cache_capacity_ <= 0 ||
+        prefix_cache_.size() < static_cast<size_t>(prefix_cache_capacity_)) {
+      return;
+    }
+    auto victim = std::min_element(
+        prefix_cache_.begin(), prefix_cache_.end(),
+        [](const CachedPrefix& a, const CachedPrefix& b) {
+          return a.last_used < b.last_used;
+        });
+    Evict(victim);
+  }
+
+  void EvictUntilTokenCapacity(int decode_tokens) {
+    while (!prefix_cache_.empty() &&
+           CachedTokenCount() + decode_tokens > n_ctx_) {
+      auto victim = std::min_element(
+          prefix_cache_.begin(), prefix_cache_.end(),
+          [](const CachedPrefix& a, const CachedPrefix& b) {
+            return a.last_used < b.last_used;
+          });
+      Evict(victim);
+    }
+  }
+
+  int CachedTokenCount() const {
+    int total = 0;
+    for (const auto& cached : prefix_cache_)
+      total += cached.length;
+    return total;
+  }
+
+  void Evict(vector<CachedPrefix>::iterator victim) {
+    llama_memory_seq_rm(llama_get_memory(context_), victim->seq_id, -1, -1);
+    free_seq_ids_.push_back(victim->seq_id);
+    prefix_cache_.erase(victim);
+  }
+
+  llama_seq_id AllocSeqId() {
+    if (free_seq_ids_.empty())
+      EvictLRUIfNeeded();
+    if (free_seq_ids_.empty()) {
+      llama_memory_clear(llama_get_memory(context_), true);
+      prefix_cache_.clear();
+      ResetSeqIds();
+    }
+    if (free_seq_ids_.empty())
+      return -1;
+    llama_seq_id seq_id = free_seq_ids_.back();
+    free_seq_ids_.pop_back();
+    return seq_id;
+  }
+
+  void ResetSeqIds() {
+    free_seq_ids_.clear();
+    const int n_seq = max_parallel_ + prefix_cache_capacity_;
+    free_seq_ids_.reserve(static_cast<size_t>(n_seq));
+    for (int i = n_seq - 1; i >= 0; --i)
+      free_seq_ids_.push_back(static_cast<llama_seq_id>(i));
+  }
+
+  void InsertOrReplacePrefix(llama_seq_id seq_id,
+                             const vector<llama_token>& tokens,
+                             vector<double>&& prefix_logprob_sums,
+                             double logprob_sum,
+                             int token_count) {
+    for (auto& cached : prefix_cache_) {
+      if (cached.tokens == tokens) {
+        if (cached.seq_id != seq_id) {
+          llama_memory_seq_rm(llama_get_memory(context_), cached.seq_id, -1,
+                              -1);
+          free_seq_ids_.push_back(cached.seq_id);
+          cached.seq_id = seq_id;
+        }
+        cached.prefix_logprob_sums = std::move(prefix_logprob_sums);
+        cached.length = static_cast<int>(tokens.size());
+        cached.logprob_sum = logprob_sum;
+        cached.token_count = token_count;
+        cached.last_used = ++access_counter_;
+        return;
+      }
+    }
+
+    EvictLRUIfNeeded();
+    CachedPrefix cached;
+    cached.tokens = tokens;
+    cached.prefix_logprob_sums = std::move(prefix_logprob_sums);
+    cached.seq_id = seq_id;
+    cached.length = static_cast<int>(tokens.size());
+    cached.logprob_sum = logprob_sum;
+    cached.token_count = token_count;
+    cached.last_used = ++access_counter_;
+    prefix_cache_.push_back(std::move(cached));
+    EvictUntilTokenCapacity(0);
+  }
+
+  static double PrefixLogprobSum(const CachedPrefix& cached, size_t length) {
+    if (length < cached.prefix_logprob_sums.size())
+      return cached.prefix_logprob_sums[length];
+    return cached.logprob_sum;
+  }
+
+  void ResetCacheStats() {
+    last_cache_lookups_ = 0;
+    last_cache_hits_ = 0;
+    last_cache_matched_total_ = 0;
+    last_avg_matched_len_ = 0.0;
+  }
+
+  void RecordCacheLookup(int matched_len) {
+    ++last_cache_lookups_;
+    if (matched_len > 0) {
+      ++last_cache_hits_;
+      last_cache_matched_total_ += matched_len;
+    }
+    last_avg_matched_len_ =
+        last_cache_lookups_ > 0
+            ? static_cast<double>(last_cache_matched_total_) /
+                  static_cast<double>(last_cache_lookups_)
+            : 0.0;
   }
 
   bool IsUnknown(llama_token token) const {
@@ -310,6 +653,16 @@ class LlamaCausalScorer : public PerplexityScorer {
   llama_context* context_ = nullptr;
   const llama_vocab* vocab_ = nullptr;
   int n_vocab_ = 0;
+  int n_ctx_ = 1024;
+  int max_parallel_ = 1;
+  int prefix_cache_capacity_ = 0;
+  vector<CachedPrefix> prefix_cache_;
+  vector<llama_seq_id> free_seq_ids_;
+  int64_t access_counter_ = 0;
+  int last_cache_lookups_ = 0;
+  int last_cache_hits_ = 0;
+  int last_cache_matched_total_ = 0;
+  double last_avg_matched_len_ = 0.0;
   double unknown_token_penalty_ = 0.0;
 };
 
