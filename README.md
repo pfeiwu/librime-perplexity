@@ -25,8 +25,8 @@ cmake -S /path/to/llama.cpp -B /path/to/llama.cpp/build -DBUILD_SHARED_LIBS=ON
 cmake --build /path/to/llama.cpp/build
 ```
 
-For GPU acceleration, add the llama.cpp backend option you need, such as CUDA,
-Vulkan, or Metal.
+For GPU acceleration, add the llama.cpp backend option you need, such as
+`-DGGML_CUDA=ON`, `-DGGML_VULKAN=ON`, or `-DGGML_METAL=ON`.
 
 Build this plugin in-tree with librime:
 
@@ -37,6 +37,7 @@ librime/plugins/perplexity
 ```bash
 cmake -S . -B build \
   -DENABLE_EXTERNAL_PLUGINS=ON \
+  -DBUILD_MERGED_PLUGINS=OFF \
   -DPERPLEXITY_LLAMA_CPP_DIR=/path/to/llama.cpp \
   -DPERPLEXITY_LLAMA_CPP_BUILD_DIR=/path/to/llama.cpp/build
 
@@ -44,6 +45,8 @@ cmake --build build --target rime-perplexity
 ```
 
 Install `librime-perplexity.{so,dylib,dll}` to your librime plugin directory.
+The plugin is dynamically linked to llama.cpp/ggml shared libraries, so those
+libraries must also be discoverable by the runtime loader.
 
 ## Schema
 
