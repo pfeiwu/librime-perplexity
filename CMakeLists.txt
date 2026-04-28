@@ -26,7 +26,9 @@ if(EXISTS "${PERPLEXITY_LLAMA_CPP_DIR}/include/llama.h" AND
     "${PERPLEXITY_LLAMA_CPP_BUILD_DIR}/bin/libggml-cpu.so")
   message(STATUS "perplexity: enabling llama.cpp causal LM scorer")
 else()
-  message(STATUS "perplexity: llama.cpp not found; building without LM scorer")
+  message(FATAL_ERROR
+    "perplexity: llama.cpp headers or shared libraries not found. "
+    "Set PERPLEXITY_LLAMA_CPP_DIR and PERPLEXITY_LLAMA_CPP_BUILD_DIR.")
 endif()
 
 if(BUILD_SHARED_LIBS)

@@ -77,6 +77,10 @@ class LlamaCausalScorer : public PerplexityScorer {
               << ", gpu_layers=" << options.gpu_layers
               << ", batch_size=" << max_parallel_
               << ", cache_size=" << prefix_cache_capacity_
+              << (prefix_cache_capacity_ > 0
+                      ? " (prefix KV cache enabled, scores not "
+                        "bit-identical to uncached baseline)"
+                      : " (prefix KV cache disabled)")
               << ", max_length=" << options.max_length;
   }
 
