@@ -11,19 +11,31 @@ set(PERPLEXITY_LLAMA_CPP_BUILD_DIR ""
   CACHE PATH "Path to llama.cpp build tree for optional perplexity scoring")
 
 set(perplexity_llama_deps)
+set(perplexity_llama_lib_dir "${PERPLEXITY_LLAMA_CPP_BUILD_DIR}/bin")
+set(perplexity_shared_suffix "${CMAKE_SHARED_LIBRARY_SUFFIX}")
 if(EXISTS "${PERPLEXITY_LLAMA_CPP_DIR}/include/llama.h" AND
-   EXISTS "${PERPLEXITY_LLAMA_CPP_BUILD_DIR}/bin/libllama.so")
+   EXISTS "${perplexity_llama_lib_dir}/libllama${perplexity_shared_suffix}")
   target_compile_definitions(rime-perplexity-objs
     PRIVATE RIME_PERPLEXITY_ENABLE_LLAMA)
   target_include_directories(rime-perplexity-objs
     PRIVATE
       "${PERPLEXITY_LLAMA_CPP_DIR}/include"
       "${PERPLEXITY_LLAMA_CPP_DIR}/ggml/include")
-  set(perplexity_llama_deps
-    "${PERPLEXITY_LLAMA_CPP_BUILD_DIR}/bin/libllama.so"
-    "${PERPLEXITY_LLAMA_CPP_BUILD_DIR}/bin/libggml.so"
-    "${PERPLEXITY_LLAMA_CPP_BUILD_DIR}/bin/libggml-base.so"
-    "${PERPLEXITY_LLAMA_CPP_BUILD_DIR}/bin/libggml-cpu.so")
+  foreach(ggml_lib
+          llama
+          ggml
+          ggml-base
+          ggml-cpu
+          ggml-metal
+          ggml-blas
+          ggml-vulkan
+          ggml-cuda
+          ggml-rpc)
+    if(EXISTS "${perplexity_llama_lib_dir}/lib${ggml_lib}${perplexity_shared_suffix}")
+      list(APPEND perplexity_llama_deps
+        "${perplexity_llama_lib_dir}/lib${ggml_lib}${perplexity_shared_suffix}")
+    endif()
+  endforeach()
   message(STATUS "perplexity: enabling llama.cpp causal LM scorer")
 else()
   message(FATAL_ERROR
