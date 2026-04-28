@@ -210,19 +210,13 @@ an<Translation> PerplexityRanker::Apply(an<Translation> translation,
     return base_scores[a] > base_scores[b];
   });
 
-  vector<bool> promoted(rankable.size(), false);
   vector<an<Candidate>> reranked;
-  reranked.reserve(rankable.size());
+  reranked.reserve(static_cast<size_t>(size_));
   const size_t promote_count =
       std::min(order.size(), static_cast<size_t>(size_));
   for (size_t i = 0; i < promote_count; ++i) {
     const size_t index = order[i];
-    promoted[index] = true;
     reranked.push_back(rankable[index]);
-  }
-  for (size_t i = 0; i < rankable.size(); ++i) {
-    if (!promoted[i])
-      reranked.push_back(rankable[i]);
   }
 
   return TranslationFromCandidates(reranked, translation);

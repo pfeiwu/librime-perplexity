@@ -50,8 +50,8 @@ script_translator
        build PerplexityInput{text, units}
        call PerplexityScorer::Score(batch)
        compute lm_score * score_weight + Phrase::weight()
-       promote first size reranked candidates
-       append remaining candidates in upstream order
+       emit first size reranked candidates
+       append the un-drained upstream tail
   -> menu
 ```
 
@@ -63,8 +63,8 @@ script_translator
   - Computes base grammar score from `Phrase::weight()`.
   - Calls a scorer once with a batch of candidate texts.
   - Sorts by `lm_average_logprob * score_weight + base_score`.
-  - Promotes the first `size` reranked candidates and keeps the rest in the
-    upstream order.
+  - Emits the first `size` reranked candidates and drops the remaining drained
+    rankable candidates.
 
 - `PerplexityScorer`
   - Model-family abstraction.

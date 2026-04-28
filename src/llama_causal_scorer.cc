@@ -17,6 +17,8 @@ namespace rime {
 
 namespace {
 
+constexpr char kCausalScoreSuffix[] = "，";
+
 static double LogSoftmaxAt(const float* logits,
                            size_t n_vocab,
                            uint32_t token) {
@@ -90,7 +92,7 @@ class LlamaCausalScorer : public PerplexityScorer {
 
     vector<vector<llama_token>> tokenized(inputs.size());
     for (size_t i = 0; i < inputs.size(); ++i) {
-      auto tokens = Tokenize(inputs[i].text);
+      auto tokens = Tokenize(inputs[i].text + kCausalScoreSuffix);
       if (tokens.size() >= 2) {
         scores[i].token_count = static_cast<int>(tokens.size()) - 1;
         tokenized[i] = std::move(tokens);
