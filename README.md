@@ -66,7 +66,7 @@ perplexity:
   batch_size: 32
   cache_size: 0
   score_weight: 60.0
-  size: 2
+  top_k: 2
   candidate_types:
     - sentence
 ```
@@ -88,6 +88,6 @@ perplexity:
 | `perplexity/score_weight` | `1.0` | LM score weight. |
 | `perplexity/unknown_token_penalty` | `0.0` | Penalty for unknown / byte-fallback tokens. |
 | `perplexity/candidate_types` | `[sentence]` | Candidate types to rerank. |
-| `perplexity/size` | `2` | Number of reranked candidates to promote. |
+| `perplexity/top_k` | `2` | Number of reranked candidates to promote. |
 
 Check Rime logs for `perplexity: loaded causal LM`.

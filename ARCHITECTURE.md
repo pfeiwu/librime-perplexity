@@ -30,7 +30,7 @@ perplexity:
   batch_size: 32
   cache_size: 0
   score_weight: 60.0
-  size: 2
+  top_k: 2
   unknown_token_penalty: 0.0
 ```
 
@@ -51,7 +51,7 @@ script_translator
        build PerplexityInput{text, units}
        call PerplexityScorer::Score(batch)
        compute lm_score * score_weight + Phrase::weight()
-       emit first size reranked candidates
+       emit first top_k reranked candidates
        append the un-drained upstream tail
   -> menu
 ```
@@ -64,7 +64,7 @@ script_translator
   - Computes base grammar score from `Phrase::weight()`.
   - Calls a scorer once with a batch of candidate texts.
   - Sorts by `lm_average_logprob * score_weight + base_score`.
-  - Emits the first `size` reranked candidates and drops the remaining drained
+  - Emits the first `top_k` reranked candidates and drops the remaining drained
     rankable candidates.
 
 - `PerplexityScorer`
@@ -78,6 +78,31 @@ script_translator
   - Uses direct per-call batching plus a private cross-call prefix KV cache.
   - Does not use beam reuse, grammar prefilter, or grouped multi-prefix
     batching.
+
+## Filter Ordering Assumption
+
+`PerplexityRanker` drains a contiguous prefix of rankable candidates from the
+upstream translation and stops at the first non-rankable one. This means
+rankable candidates, by default `sentence`, must appear contiguously at the
+front of the upstream stream.
+
+Place this filter early in the filter chain, immediately after candidate
+deduplication such as `uniquifier`, and before any filter that may reorder or
+interleave sentence candidates with non-sentence ones, such as custom Lua
+filters that re-sort by frequency or word length.
+
+Recommended position:
+
+```yaml
+engine:
+  filters:
+    - uniquifier
+    - perplexity_ranker
+    # ... other filters
+```
+
+Filters placed downstream of `perplexity_ranker` operate on the already
+reranked output and can apply their own logic.
 
 ## Caching
 
@@ -148,7 +173,7 @@ resolves either path, this drift will disappear automatically.
 | `perplexity/score_weight` | `1.0` | Multiplier for LM average log probability before adding base score. |
 | `perplexity/unknown_token_penalty` | `0.0` | Penalty for unknown or byte-fallback tokens. |
 | `perplexity/candidate_types` | `[sentence]` | Candidate types this filter reranks. |
-| `perplexity/size` | `2` | Number of reranked candidates promoted to the front. |
+| `perplexity/top_k` | `2` | Number of reranked candidates promoted to the front. |
 
 ## Planned Scorer Families
 

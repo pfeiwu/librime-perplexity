@@ -123,7 +123,7 @@ PerplexityRanker::PerplexityRanker(const Ticket& ticket)
   if (!engine_)
     return;
   if (Config* config = engine_->schema()->config()) {
-    config->GetInt(name_space_ + "/size", &size_);
+    config->GetInt(name_space_ + "/top_k", &top_k_);
     config->GetDouble(name_space_ + "/score_weight", &score_weight_);
     if (auto types = config->GetList(name_space_ + "/candidate_types")) {
       for (auto it = types->begin(); it != types->end(); ++it) {
@@ -151,6 +151,10 @@ an<Translation> PerplexityRanker::Apply(an<Translation> translation,
   if (!translation || translation->exhausted())
     return translation;
 
+  const bool should_rank = scorer_ && scorer_->Ready() && top_k_ > 0;
+  if (!should_rank)
+    return translation;
+
   vector<an<Candidate>> rankable;
   rankable.reserve(64);
   while (rankable.size() < kMaxDrainCandidates && !translation->exhausted()) {
@@ -162,15 +166,6 @@ an<Translation> PerplexityRanker::Apply(an<Translation> translation,
   }
   if (rankable.empty())
     return translation;
-
-  if (size_ <= 0) {
-    return TranslationFromCandidates(rankable, translation);
-  }
-
-  const bool should_rank = scorer_ && scorer_->Ready();
-  if (!should_rank) {
-    return TranslationFromCandidates(rankable, translation);
-  }
 
   vector<PerplexityInput> inputs;
   inputs.reserve(rankable.size());
@@ -197,7 +192,7 @@ an<Translation> PerplexityRanker::Apply(an<Translation> translation,
                     ? lm_scores[index].average_logprob
                     : -std::numeric_limits<double>::infinity();
     if (!std::isfinite(lm))
-      return lm;
+      return base_scores[index];
     return lm * score_weight_ + base_scores[index];
   };
 
@@ -212,9 +207,9 @@ an<Translation> PerplexityRanker::Apply(an<Translation> translation,
   });
 
   vector<an<Candidate>> reranked;
-  reranked.reserve(static_cast<size_t>(size_));
+  reranked.reserve(static_cast<size_t>(top_k_));
   const size_t promote_count =
-      std::min(order.size(), static_cast<size_t>(size_));
+      std::min(order.size(), static_cast<size_t>(top_k_));
   for (size_t i = 0; i < promote_count; ++i) {
     const size_t index = order[i];
     reranked.push_back(rankable[index]);

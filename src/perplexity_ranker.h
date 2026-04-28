@@ -26,7 +26,7 @@ class PerplexityRanker : public Filter, public TagMatching {
  private:
   bool IsRankableCandidate(const an<Candidate>& cand) const;
 
-  int size_ = 2;
+  int top_k_ = 2;
   double score_weight_ = 1.0;
   hash_set<string> candidate_types_;
   std::unique_ptr<PerplexityScorer> scorer_;
