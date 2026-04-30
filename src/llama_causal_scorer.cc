@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <exception>
 #include <limits>
 
 #ifdef RIME_PERPLEXITY_ENABLE_LLAMA
@@ -16,8 +17,6 @@
 namespace rime {
 
 namespace {
-
-constexpr char kCausalScoreSuffix[] = "，";
 
 static double LogSoftmaxAt(const float* logits,
                            size_t n_vocab,
@@ -40,7 +39,8 @@ class LlamaCausalScorer : public PerplexityScorer {
   explicit LlamaCausalScorer(const PerplexityScorerOptions& options)
       : max_parallel_(std::max(1, options.batch_size)),
         prefix_cache_capacity_(std::max(0, options.cache_size)),
-        unknown_token_penalty_(std::max(0.0, options.unknown_token_penalty)) {
+        unknown_token_penalty_(std::max(0.0, options.unknown_token_penalty)),
+        score_suffix_(options.score_suffix) {
     ggml_backend_load_all();
 
     llama_model_params model_params = llama_model_default_params();
@@ -101,7 +101,7 @@ class LlamaCausalScorer : public PerplexityScorer {
 
     vector<vector<llama_token>> tokenized(inputs.size());
     for (size_t i = 0; i < inputs.size(); ++i) {
-      auto tokens = Tokenize(inputs[i].text + kCausalScoreSuffix);
+      auto tokens = Tokenize(inputs[i].text + score_suffix_);
       if (tokens.size() >= 2) {
         scores[i].token_count = static_cast<int>(tokens.size()) - 1;
         tokenized[i] = std::move(tokens);
@@ -184,16 +184,24 @@ class LlamaCausalScorer : public PerplexityScorer {
   }
 
   vector<llama_token> Tokenize(const string& text) const {
-    int n = -llama_tokenize(vocab_, text.c_str(), text.size(), nullptr, 0,
-                            false, true);
-    if (n <= 0)
+    if (text.empty())
       return {};
-    vector<llama_token> tokens(n);
-    if (llama_tokenize(vocab_, text.c_str(), text.size(), tokens.data(),
-                       tokens.size(), false, true) < 0) {
+    try {
+      int n = -llama_tokenize(vocab_, text.c_str(), text.size(), nullptr, 0,
+                              false, true);
+      if (n <= 0)
+        return {};
+      vector<llama_token> tokens(n);
+      if (llama_tokenize(vocab_, text.c_str(), text.size(), tokens.data(),
+                         tokens.size(), false, true) < 0) {
+        return {};
+      }
+      return tokens;
+    } catch (const std::exception& e) {
+      LOG(ERROR) << "perplexity: causal tokenize threw on text=\""
+                 << text.substr(0, 64) << "\": " << e.what();
       return {};
     }
-    return tokens;
   }
 
   double ScoreTokens(const vector<llama_token>& tokens) {
@@ -668,6 +676,7 @@ class LlamaCausalScorer : public PerplexityScorer {
   int last_cache_matched_total_ = 0;
   double last_avg_matched_len_ = 0.0;
   double unknown_token_penalty_ = 0.0;
+  string score_suffix_;
 };
 
 #endif  // RIME_PERPLEXITY_ENABLE_LLAMA

@@ -37,6 +37,7 @@ struct PerplexityScorerOptions {
   int cache_size = 0;
   int gpu_layers = 0;
   double unknown_token_penalty = 0.0;
+  string score_suffix = "，";
 };
 
 class PerplexityScorer {

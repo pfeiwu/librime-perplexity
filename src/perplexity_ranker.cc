@@ -109,6 +109,7 @@ static std::unique_ptr<PerplexityScorer> CreateScorer(Config* config,
   config->GetInt(ns + "/gpu_layers", &options.gpu_layers);
   config->GetDouble(ns + "/unknown_token_penalty",
                     &options.unknown_token_penalty);
+  config->GetString(ns + "/score_suffix", &options.score_suffix);
   return CreatePerplexityScorer(options);
 }
 
