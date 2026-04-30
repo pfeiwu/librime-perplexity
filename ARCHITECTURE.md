@@ -69,15 +69,31 @@ script_translator
 
 - `PerplexityScorer`
   - Model-family abstraction.
-  - Input contains both surface text and phrase units.  Causal LM uses text;
-    masked LM can later use units for word-aware pseudo-log-likelihood.
+  - Input contains both surface text and phrase units.  The current causal and
+    masked scorers use the surface text; phrase units are kept for future
+    word-aware PLL variants.
 
 - `LlamaCausalScorer`
-  - Current runnable backend.
+  - Causal LM backend.
   - Scores causal LM average log probability with llama.cpp.
   - Uses direct per-call batching plus a private cross-call prefix KV cache.
   - Does not use beam reuse, grammar prefilter, or grouped multi-prefix
     batching.
+
+- `OnnxMaskedScorer`
+  - Optional backend, enabled by `PERPLEXITY_ONNXRUNTIME_DIR`.
+  - Scores masked LM pseudo-log-likelihood (PLL) with ONNX Runtime.
+  - Loads standard BERT ONNX graphs with `input_ids`, `attention_mask`, optional
+    `token_type_ids`, and `logits` output.
+  - Loads `vocab.txt` next to the ONNX model and uses a small WordPiece
+    tokenizer path intended for BERT-style Chinese models.
+  - For each candidate of length n, creates n masked copies and batches those
+    copies through ONNX Runtime.
+  - Does not use prefix KV cache; bidirectional attention makes prefix reuse
+    invalid.
+  - `device: gpu` tries the platform EP when the ONNX Runtime headers expose
+    it: Linux CUDA, macOS CoreML, Windows DirectML. Otherwise it falls back to
+    CPU and logs a warning.
 
 ## Filter Ordering Assumption
 
@@ -106,17 +122,16 @@ reranked output and can apply their own logic.
 
 ## Caching
 
-`PerplexityRanker` itself is stateless; the underlying
-`LlamaCausalScorer` exposes an optional **persistent prefix KV cache**
-controlled by `perplexity/cache_size`.
+`PerplexityRanker` itself is stateless. The underlying scorer may keep an
+optional cache controlled by `perplexity/cache_size`.
 
 ### Default: disabled (`cache_size: 0`)
 
-All scoring is fresh decode with KV cleared between batches. Scores are
-deterministic across runs and reproducible regardless of session history.
-Recommended for evaluation and as a sane default.
+All scoring is fresh. Scores are deterministic across runs and reproducible
+regardless of session history. Recommended for evaluation and as a sane
+default.
 
-### Opt-in: prefix KV cache (`cache_size: N`)
+### Causal-only: prefix KV cache (`cache_size: N`)
 
 When `cache_size > 0`, the scorer keeps the most-recently-used N scored
 prefixes resident in llama.cpp's KV pool and reuses their KV (via `seq_cp` +
@@ -159,25 +174,37 @@ rejects partial `seq_cp`, which our prefix-reuse strategy requires. A
 reproducer has been filed upstream as <ISSUE_LINK_PLACEHOLDER>; if upstream
 resolves either path, this drift will disappear automatically.
 
+### Masked: sentence-level cache (`cache_size: N`)
+
+Masked LM uses bidirectional attention, so prefix KV reuse is not valid. When
+`cache_size > 0`, `OnnxMaskedScorer` instead keeps an LRU cache of complete
+sentence scores keyed by candidate text.
+
+This cache has no numerical drift: a cache hit returns the exact normalized
+`PerplexityScore` previously computed for the same text. It only avoids
+re-tokenizing, rebuilding mask copies, and re-running ONNX inference for
+duplicate sentences.
+
 ## Parameters
+
+All parameters apply to both `causal` and `masked` model types unless noted.
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `perplexity/model_type` | `causal` | Scorer family: `causal` now, `masked` planned. |
+| `perplexity/model_type` | `causal` | Scorer family: `causal` or `masked`. |
 | `perplexity/model` | empty | Rime resource path to the model. Empty disables scoring. |
 | `perplexity/device` | `cpu` | `cpu` maps to `gpu_layers=0`; `gpu` maps to `gpu_layers=-1`. |
-| `perplexity/gpu_layers` | unset | Advanced override for llama.cpp GPU offload. |
-| `perplexity/max_length` | `1024` | Maximum model context length. |
-| `perplexity/batch_size` | `32` | Maximum candidate sequences scored in one batch. |
-| `perplexity/cache_size` | `0` | Prefix KV cache capacity. `0` disables caching. |
+| `perplexity/gpu_layers` | unset | Advanced llama.cpp GPU offload override; for masked, nonzero means try GPU EP. |
+| `perplexity/max_length` | `1024` | Maximum causal context or masked sequence length. |
+| `perplexity/batch_size` | `32` | Maximum causal candidate batch size or masked-token copy batch size. |
+| `perplexity/cache_size` | `0` | LRU capacity. Causal: prefix KV cache entries; masked: complete sentence score entries. `0` disables caching. |
 | `perplexity/score_weight` | `1.0` | Multiplier for LM average log probability before adding base score. |
 | `perplexity/unknown_token_penalty` | `0.0` | Penalty for unknown or byte-fallback tokens. |
 | `perplexity/candidate_types` | `[sentence]` | Candidate types this filter reranks. |
 | `perplexity/top_k` | `2` | Number of reranked candidates promoted to the front. |
 
-## Planned Scorer Families
+## Scorer Families
 
 - `causal`: left-to-right LM perplexity.
-- `masked`: masked LM pseudo-log-likelihood.  The interface is already shaped
-  for this, but the C++ backend is not implemented yet.
+- `masked`: masked LM pseudo-log-likelihood via ONNX Runtime.
 - Encoder-decoder LM is out of scope for now.

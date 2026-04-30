@@ -25,6 +25,8 @@ class NullPerplexityScorer : public PerplexityScorer {
 
 std::unique_ptr<PerplexityScorer> CreateLlamaCausalScorer(
     const PerplexityScorerOptions& options);
+std::unique_ptr<PerplexityScorer> CreateOnnxMaskedScorer(
+    const PerplexityScorerOptions& options);
 
 std::unique_ptr<PerplexityScorer> CreatePerplexityScorer(
     const PerplexityScorerOptions& options) {
@@ -32,8 +34,7 @@ std::unique_ptr<PerplexityScorer> CreatePerplexityScorer(
     return std::make_unique<NullPerplexityScorer>();
   }
   if (options.model_type == PerplexityModelType::kMaskedLm) {
-    LOG(ERROR) << "perplexity: masked LM scorer is not implemented yet";
-    return std::make_unique<NullPerplexityScorer>();
+    return CreateOnnxMaskedScorer(options);
   }
   return CreateLlamaCausalScorer(options);
 }

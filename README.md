@@ -13,8 +13,10 @@ meaningless; the needed support is in librime commit `9422ca7`
 ## Requirements
 
 - librime after commit `9422ca7`, built with external plugin support.
-- llama.cpp headers and shared libraries.
-- A GGUF causal LM model.
+- At least one scorer backend:
+  - causal LM: llama.cpp headers/shared libraries + a GGUF model.
+  - masked LM: ONNX Runtime headers/shared libraries + a BERT-style ONNX
+    model and `vocab.txt`.
 
 ## Build
 
@@ -39,14 +41,60 @@ cmake -S . -B build \
   -DENABLE_EXTERNAL_PLUGINS=ON \
   -DBUILD_MERGED_PLUGINS=OFF \
   -DPERPLEXITY_LLAMA_CPP_DIR=/path/to/llama.cpp \
-  -DPERPLEXITY_LLAMA_CPP_BUILD_DIR=/path/to/llama.cpp/build
+  -DPERPLEXITY_LLAMA_CPP_BUILD_DIR=/path/to/llama.cpp/build \
+  -DPERPLEXITY_ONNXRUNTIME_DIR=/path/to/onnxruntime
 
 cmake --build build --target rime-perplexity
 ```
 
 Install `librime-perplexity.{so,dylib,dll}` to your librime plugin directory.
-The plugin is dynamically linked to llama.cpp/ggml shared libraries, so those
-libraries must also be discoverable by the runtime loader.
+The plugin is dynamically linked to its selected backend libraries, so
+llama.cpp/ggml or ONNX Runtime libraries must also be discoverable by the
+runtime loader.
+
+`PERPLEXITY_LLAMA_CPP_*` is only needed for `model_type: causal`.
+`PERPLEXITY_ONNXRUNTIME_DIR` is only needed for `model_type: masked`.
+
+## Models
+
+### Causal LM
+
+Use a GGUF model:
+
+```yaml
+perplexity:
+  model_type: causal
+  model: models/your-model.gguf
+```
+
+### Masked LM
+
+Export a BERT-style masked LM to ONNX, and place `vocab.txt` next to
+`model.onnx`:
+
+```text
+models/bert-base-chinese/
+  model.onnx
+  vocab.txt
+```
+
+The ONNX graph should expose standard BERT inputs:
+
+```text
+input_ids, attention_mask[, token_type_ids] -> logits
+```
+
+Schema:
+
+```yaml
+perplexity:
+  model_type: masked
+  model: models/bert-base-chinese/model.onnx
+  device: cpu
+  batch_size: 32
+  score_weight: 60.0
+  top_k: 2
+```
 
 ## Schema
 
@@ -81,16 +129,25 @@ perplexity:
 
 | Key | Default | Description |
 | --- | --- | --- |
-| `perplexity/model_type` | `causal` | `causal` now; `masked` is reserved for MLM pseudo-perplexity. |
+| `perplexity/model_type` | `causal` | `causal` or `masked`. |
 | `perplexity/model` | empty | Model path. |
-| `perplexity/device` | `cpu` | `cpu` or `gpu`. |
-| `perplexity/gpu_layers` | unset | llama.cpp GPU layer override. |
-| `perplexity/max_length` | `1024` | Context length. |
-| `perplexity/batch_size` | `32` | Scoring batch size. |
-| `perplexity/cache_size` | `0` | Prefix KV cache size; `0` disables it. |
+| `perplexity/device` | `cpu` | `cpu` or `gpu`; masked uses ONNX Runtime EP when available. |
+| `perplexity/gpu_layers` | unset | llama.cpp GPU layer override; for masked, nonzero means try GPU EP. |
+| `perplexity/max_length` | `1024` | Maximum causal context or masked sequence length. |
+| `perplexity/batch_size` | `32` | Causal candidate batch size, or masked-token copy batch size. |
+| `perplexity/cache_size` | `0` | LRU capacity. Causal: prefix KV cache entries; masked: sentence score cache entries. `0` disables caching. |
 | `perplexity/score_weight` | `1.0` | LM score weight. |
 | `perplexity/unknown_token_penalty` | `0.0` | Penalty for unknown / byte-fallback tokens. |
 | `perplexity/candidate_types` | `[sentence]` | Candidate types to rerank. |
 | `perplexity/top_k` | `2` | Number of reranked candidates to promote. |
 
 Check Rime logs for `perplexity: loaded causal LM`.
+
+## Notes
+
+- Check the generated schema after deploy; `*.custom.yaml` alone is not proof
+  that Rime loaded the intended config.
+- For masked GPU, check the log for `ep=CUDA` / `ep=CoreML` / `ep=DirectML`.
+  ONNX Runtime GPU builds are tied to specific CUDA versions.
+- For causal cache, keep `batch_size + cache_size` within the model's
+  llama.cpp sequence limit.
