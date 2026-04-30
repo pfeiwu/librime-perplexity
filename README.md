@@ -138,6 +138,8 @@ perplexity:
 | `perplexity/cache_size` | `0` | LRU capacity. Causal: prefix KV cache entries; masked: sentence score cache entries. `0` disables caching. |
 | `perplexity/score_weight` | `1.0` | LM score weight. |
 | `perplexity/unknown_token_penalty` | `0.0` | Penalty for unknown / byte-fallback tokens. |
+| `perplexity/score_prefix` | `，` | Optional text or special token prepended before scoring. |
+| `perplexity/score_suffix` | `，` | Optional text or special token appended before scoring. |
 | `perplexity/candidate_types` | `[sentence]` | Candidate types to rerank. |
 | `perplexity/top_k` | `2` | Number of reranked candidates to promote. |
 

@@ -40,6 +40,7 @@ class LlamaCausalScorer : public PerplexityScorer {
       : max_parallel_(std::max(1, options.batch_size)),
         prefix_cache_capacity_(std::max(0, options.cache_size)),
         unknown_token_penalty_(std::max(0.0, options.unknown_token_penalty)),
+        score_prefix_(options.score_prefix),
         score_suffix_(options.score_suffix) {
     ggml_backend_load_all();
 
@@ -101,7 +102,7 @@ class LlamaCausalScorer : public PerplexityScorer {
 
     vector<vector<llama_token>> tokenized(inputs.size());
     for (size_t i = 0; i < inputs.size(); ++i) {
-      auto tokens = Tokenize(inputs[i].text + score_suffix_);
+      auto tokens = Tokenize(score_prefix_ + inputs[i].text + score_suffix_);
       if (tokens.size() >= 2) {
         scores[i].token_count = static_cast<int>(tokens.size()) - 1;
         tokenized[i] = std::move(tokens);
@@ -226,7 +227,7 @@ class LlamaCausalScorer : public PerplexityScorer {
     }
 
     const float* logits = llama_get_logits(context_);
-    double sum = 0.0;
+    double sum = tokens.empty() ? 0.0 : -TokenPenalty(tokens.front());
     int count = 0;
     for (size_t i = 0; i + 1 < tokens.size(); ++i) {
       sum += LogSoftmaxAt(logits + static_cast<size_t>(count) * n_vocab_,
@@ -285,7 +286,7 @@ class LlamaCausalScorer : public PerplexityScorer {
     int logits_pos = 0;
     for (size_t i = start; i < end; ++i) {
       const auto& tokens = tokenized[i];
-      double sum = 0.0;
+      double sum = tokens.empty() ? 0.0 : -TokenPenalty(tokens.front());
       int count = 0;
       for (size_t j = 0; j + 1 < tokens.size(); ++j) {
         sum += LogSoftmaxAt(logits + static_cast<size_t>(logits_pos) * n_vocab_,
@@ -411,6 +412,11 @@ class LlamaCausalScorer : public PerplexityScorer {
             std::min(prefix_sums.size(), plan.cached_prefix_sums.size());
         for (size_t i = 0; i < copy_len; ++i)
           prefix_sums[i] = plan.cached_prefix_sums[i];
+      }
+      if (plan.decode_start == 0 && !tokens.empty()) {
+        const double first_token_penalty = TokenPenalty(tokens.front());
+        plan.suffix_logprob_sum -= first_token_penalty;
+        prefix_sums[1] = -first_token_penalty;
       }
       for (size_t j = static_cast<size_t>(plan.decode_start);
            j + 1 < tokens.size(); ++j) {
@@ -676,6 +682,7 @@ class LlamaCausalScorer : public PerplexityScorer {
   int last_cache_matched_total_ = 0;
   double last_avg_matched_len_ = 0.0;
   double unknown_token_penalty_ = 0.0;
+  string score_prefix_;
   string score_suffix_;
 };
 

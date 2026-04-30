@@ -200,6 +200,8 @@ All parameters apply to both `causal` and `masked` model types unless noted.
 | `perplexity/cache_size` | `0` | LRU capacity. Causal: prefix KV cache entries; masked: complete sentence score entries. `0` disables caching. |
 | `perplexity/score_weight` | `1.0` | Multiplier for LM average log probability before adding base score. |
 | `perplexity/unknown_token_penalty` | `0.0` | Penalty for unknown or byte-fallback tokens. |
+| `perplexity/score_prefix` | `，` | Optional text or special token prepended before scoring. |
+| `perplexity/score_suffix` | `，` | Optional text or special token appended before scoring. |
 | `perplexity/candidate_types` | `[sentence]` | Candidate types this filter reranks. |
 | `perplexity/top_k` | `2` | Number of reranked candidates promoted to the front. |
 
