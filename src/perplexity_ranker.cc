@@ -23,8 +23,8 @@ namespace rime {
 
 namespace {
 
-constexpr size_t kMaxDrainCandidates = 256;
 const ResourceType kModelFileType = {"perplexity_model", "", ""};
+constexpr size_t kMaxDrainRankableCandidates = 256;
 
 static string NormalizeModelType(string value) {
   std::replace(value.begin(), value.end(), '-', '_');
@@ -157,13 +157,18 @@ an<Translation> PerplexityRanker::Apply(an<Translation> translation,
     return translation;
 
   vector<an<Candidate>> rankable;
-  rankable.reserve(64);
-  while (rankable.size() < kMaxDrainCandidates && !translation->exhausted()) {
+  rankable.reserve(kMaxDrainRankableCandidates);
+  while (rankable.size() < kMaxDrainRankableCandidates &&
+         !translation->exhausted()) {
     auto cand = translation->Peek();
     if (!IsRankableCandidate(cand))
       break;
     rankable.push_back(cand);
     translation->Next();
+  }
+  if (rankable.size() == kMaxDrainRankableCandidates && !translation->exhausted()) {
+    LOG(WARNING) << "perplexity: stopped draining after "
+                 << kMaxDrainRankableCandidates << " rankable candidates";
   }
   if (rankable.empty())
     return translation;
@@ -206,6 +211,24 @@ an<Translation> PerplexityRanker::Apply(an<Translation> translation,
       return score_a > score_b;
     return base_scores[a] > base_scores[b];
   });
+
+  const size_t debug_count = std::min(order.size(), static_cast<size_t>(20));
+  for (size_t rank = 0; rank < debug_count; ++rank) {
+    const size_t index = order[rank];
+    const double lm =
+        index < lm_scores.size()
+            ? lm_scores[index].average_logprob
+            : -std::numeric_limits<double>::infinity();
+    LOG(INFO) << "perplexity_score rank=" << (rank + 1)
+              << " src_rank=" << (index + 1)
+              << " llm=" << lm
+              << " base=" << base_scores[index]
+              << " total=" << combined_score(index)
+              << " tokens="
+              << (index < lm_scores.size() ? lm_scores[index].token_count : 0)
+              << " type=" << rankable[index]->type()
+              << " text=" << rankable[index]->text();
+  }
 
   vector<an<Candidate>> reranked;
   reranked.reserve(static_cast<size_t>(top_k_));
