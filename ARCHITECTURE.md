@@ -22,7 +22,7 @@ engine:
     - perplexity_ranker
 
 perplexity:
-  candidate_types: [sentence]
+  rank_types: [sentence]
   model_type: causal
   model: models/example.gguf
   device: cpu
@@ -30,7 +30,10 @@ perplexity:
   batch_size: 32
   cache_size: 0
   score_weight: 60.0
+  scan_size: 50
+  rank_size: 20
   top_k: 2
+  history_context_commits: 0
   unknown_token_penalty: 0.0
 ```
 
@@ -45,14 +48,16 @@ data directory second.
 
 ```text
 script_translator
-  -> sentence candidates
+  -> candidates
   -> PerplexityRanker
-       drain rankable candidate prefix
-       build PerplexityInput{text, units}
+       scan a bounded upstream candidate window
+       collect rankable candidates by Candidate::type()
+       build PerplexityInput{context, text, units}
        call PerplexityScorer::Score(batch)
        compute lm_score * score_weight + Phrase::weight()
-       emit first top_k reranked candidates
-       append the un-drained upstream tail
+       fill original rankable slots with up to top_k reranked candidates
+       keep scanned non-rankable candidates in place
+       append the upstream tail
   -> menu
 ```
 
@@ -60,12 +65,15 @@ script_translator
 
 - `PerplexityRanker`
   - Rime `Filter` implementation.
-  - Drains a bounded prefix of upstream candidates whose type is rankable.
+  - Scans a bounded upstream candidate window and scores candidates whose type
+    is rankable.
+  - Can use recent commit-history records as scoring context without scoring
+    the history text itself.
   - Computes base grammar score from `Phrase::weight()`.
   - Calls a scorer once with a batch of candidate texts.
   - Sorts by `lm_average_logprob * score_weight + base_score`.
-  - Emits the first `top_k` reranked candidates and drops the remaining drained
-    rankable candidates.
+  - Fills the original rankable slots with up to `top_k` reranked candidates
+    and drops the remaining scored rankable candidates.
 
 - `PerplexityScorer`
   - Model-family abstraction.
@@ -97,15 +105,12 @@ script_translator
 
 ## Filter Ordering Assumption
 
-`PerplexityRanker` drains a contiguous prefix of rankable candidates from the
-upstream translation and stops at the first non-rankable one. This means
-rankable candidates, by default `sentence`, must appear contiguously at the
-front of the upstream stream.
+`PerplexityRanker` scans a bounded upstream window. Non-rankable candidates in
+that window keep their original positions; only rankable slots are filled with
+reranked candidates.
 
-Place this filter early in the filter chain, immediately after candidate
-deduplication such as `uniquifier`, and before any filter that may reorder or
-interleave sentence candidates with non-sentence ones, such as custom Lua
-filters that re-sort by frequency or word length.
+Place this filter after candidate deduplication such as `uniquifier`. If a
+later filter reorders candidates, it can undo the LM ranking.
 
 Recommended position:
 
@@ -202,8 +207,11 @@ All parameters apply to both `causal` and `masked` model types unless noted.
 | `perplexity/unknown_token_penalty` | `0.0` | Penalty for unknown or byte-fallback tokens. |
 | `perplexity/score_prefix` | `，` | Optional text or special token prepended before scoring. |
 | `perplexity/score_suffix` | `，` | Optional text or special token appended before scoring. |
-| `perplexity/candidate_types` | `[sentence]` | Candidate types this filter reranks. |
-| `perplexity/top_k` | `2` | Number of reranked candidates promoted to the front. |
+| `perplexity/scan_size` | `50` | Number of upstream candidates to scan. |
+| `perplexity/rank_size` | `20` | Maximum number of rankable candidates visible to the LM scorer. |
+| `perplexity/rank_types` | `[sentence]` | Candidate types this filter reranks. |
+| `perplexity/top_k` | `2` | Output cap for reranked candidates kept in rankable slots. |
+| `perplexity/history_context_commits` | `0` | Recent commit-history records used as scoring context. |
 
 ## Scorer Families
 

@@ -34,6 +34,24 @@ static double LogSoftmaxAt(const float* logits,
 
 #ifdef RIME_PERPLEXITY_ENABLE_LLAMA
 
+struct TokenizedInput {
+  vector<llama_token> tokens;
+  int score_start = 0;
+};
+
+static int ScoredTokenCount(size_t token_count, int score_start) {
+  const int start = std::max(1, score_start);
+  return std::max(0, static_cast<int>(token_count) - start);
+}
+
+static int ScoredTokenCount(const TokenizedInput& input) {
+  return ScoredTokenCount(input.tokens.size(), input.score_start);
+}
+
+static size_t ScorePrefixSumStart(int score_start) {
+  return static_cast<size_t>(std::max(0, score_start));
+}
+
 class LlamaCausalScorer : public PerplexityScorer {
  public:
   explicit LlamaCausalScorer(const PerplexityScorerOptions& options)
@@ -100,12 +118,15 @@ class LlamaCausalScorer : public PerplexityScorer {
     if (!Ready())
       return scores;
 
-    vector<vector<llama_token>> tokenized(inputs.size());
+    vector<TokenizedInput> tokenized(inputs.size());
     for (size_t i = 0; i < inputs.size(); ++i) {
-      auto tokens = Tokenize(score_prefix_ + inputs[i].text + score_suffix_);
-      if (tokens.size() >= 2) {
-        scores[i].token_count = static_cast<int>(tokens.size()) - 1;
-        tokenized[i] = std::move(tokens);
+      const string prefix = inputs[i].context + score_prefix_;
+      auto prefix_tokens = Tokenize(prefix);
+      auto tokens = Tokenize(prefix + inputs[i].text + score_suffix_);
+      const int score_start = static_cast<int>(prefix_tokens.size());
+      if (score_start < static_cast<int>(tokens.size())) {
+        tokenized[i] = {std::move(tokens), score_start};
+        scores[i].token_count = ScoredTokenCount(tokenized[i]);
       }
     }
     ScoreDirect(tokenized, &scores);
@@ -137,6 +158,7 @@ class LlamaCausalScorer : public PerplexityScorer {
     llama_seq_id seq_id = -1;
     int cache_index = -1;
     int matched_len = 0;
+    int score_start = 0;
     int decode_start = 0;
     double cached_logprob_sum = 0.0;
     int cached_token_count = 0;
@@ -146,12 +168,12 @@ class LlamaCausalScorer : public PerplexityScorer {
     bool full_cache_hit = false;
   };
 
-  void ScoreDirect(const vector<vector<llama_token>>& tokenized,
+  void ScoreDirect(const vector<TokenizedInput>& tokenized,
                    vector<PerplexityScore>* scores) {
     ResetCacheStats();
     size_t start = 0;
     while (start < tokenized.size()) {
-      if (tokenized[start].empty()) {
+      if (tokenized[start].tokens.empty()) {
         ++start;
         continue;
       }
@@ -162,11 +184,11 @@ class LlamaCausalScorer : public PerplexityScorer {
           std::max(1, static_cast<int>(llama_n_batch(context_)));
       const size_t max_seqs = static_cast<size_t>(max_parallel_);
       while (end < tokenized.size() && end - start < max_seqs) {
-        if (tokenized[end].empty()) {
+        if (tokenized[end].tokens.empty()) {
           ++end;
           continue;
         }
-        const int n = static_cast<int>(tokenized[end].size());
+        const int n = static_cast<int>(tokenized[end].tokens.size());
         if (total_tokens > 0 && total_tokens + n > max_tokens)
           break;
         total_tokens += n;
@@ -205,9 +227,11 @@ class LlamaCausalScorer : public PerplexityScorer {
     }
   }
 
-  double ScoreTokens(const vector<llama_token>& tokens) {
+  double ScoreTokens(const TokenizedInput& input) {
     if (prefix_cache_capacity_ > 0)
-      return ScoreTokensWithCache(tokens);
+      return ScoreTokensWithCache(input);
+
+    const auto& tokens = input.tokens;
 
     llama_memory_clear(llama_get_memory(context_), true);
 
@@ -227,19 +251,25 @@ class LlamaCausalScorer : public PerplexityScorer {
     }
 
     const float* logits = llama_get_logits(context_);
-    double sum = tokens.empty() ? 0.0 : -TokenPenalty(tokens.front());
+    double sum = 0.0;
+    if (input.score_start <= 0 && !tokens.empty())
+      sum -= TokenPenalty(tokens.front());
     int count = 0;
     for (size_t i = 0; i + 1 < tokens.size(); ++i) {
-      sum += LogSoftmaxAt(logits + static_cast<size_t>(count) * n_vocab_,
-                          n_vocab_, tokens[i + 1]);
-      sum -= TokenPenalty(tokens[i + 1]);
+      if (static_cast<int>(i + 1) >= input.score_start) {
+        sum += LogSoftmaxAt(logits + static_cast<size_t>(count) * n_vocab_,
+                            n_vocab_, tokens[i + 1]);
+        sum -= TokenPenalty(tokens[i + 1]);
+      }
       ++count;
     }
     llama_batch_free(batch);
-    return count > 0 ? sum / count : -std::numeric_limits<double>::infinity();
+    const int score_count = ScoredTokenCount(input);
+    return score_count > 0 ? sum / score_count
+                           : -std::numeric_limits<double>::infinity();
   }
 
-  void ScoreTokenBatch(const vector<vector<llama_token>>& tokenized,
+  void ScoreTokenBatch(const vector<TokenizedInput>& tokenized,
                        size_t start,
                        size_t end,
                        vector<PerplexityScore>* scores) {
@@ -252,7 +282,7 @@ class LlamaCausalScorer : public PerplexityScorer {
 
     int total_tokens = 0;
     for (size_t i = start; i < end; ++i) {
-      total_tokens += static_cast<int>(tokenized[i].size());
+      total_tokens += static_cast<int>(tokenized[i].tokens.size());
     }
     if (total_tokens <= 0)
       return;
@@ -260,7 +290,7 @@ class LlamaCausalScorer : public PerplexityScorer {
     llama_batch batch = llama_batch_init(total_tokens, 0, end - start);
     int token_pos = 0;
     for (size_t i = start; i < end; ++i) {
-      const auto& tokens = tokenized[i];
+      const auto& tokens = tokenized[i].tokens;
       const llama_seq_id seq_id = static_cast<llama_seq_id>(i - start);
       for (size_t j = 0; j < tokens.size(); ++j) {
         batch.token[token_pos] = tokens[j];
@@ -276,7 +306,7 @@ class LlamaCausalScorer : public PerplexityScorer {
     if (llama_decode(context_, batch) != 0) {
       llama_batch_free(batch);
       for (size_t i = start; i < end; ++i) {
-        if (!tokenized[i].empty())
+        if (!tokenized[i].tokens.empty())
           (*scores)[i].average_logprob = ScoreTokens(tokenized[i]);
       }
       return;
@@ -285,30 +315,36 @@ class LlamaCausalScorer : public PerplexityScorer {
     const float* logits = llama_get_logits(context_);
     int logits_pos = 0;
     for (size_t i = start; i < end; ++i) {
-      const auto& tokens = tokenized[i];
-      double sum = tokens.empty() ? 0.0 : -TokenPenalty(tokens.front());
-      int count = 0;
+      const auto& input = tokenized[i];
+      const auto& tokens = input.tokens;
+      double sum = 0.0;
+      if (input.score_start <= 0 && !tokens.empty())
+        sum -= TokenPenalty(tokens.front());
       for (size_t j = 0; j + 1 < tokens.size(); ++j) {
-        sum += LogSoftmaxAt(logits + static_cast<size_t>(logits_pos) * n_vocab_,
-                            n_vocab_, tokens[j + 1]);
-        sum -= TokenPenalty(tokens[j + 1]);
+        if (static_cast<int>(j + 1) >= input.score_start) {
+          sum +=
+              LogSoftmaxAt(logits + static_cast<size_t>(logits_pos) * n_vocab_,
+                           n_vocab_, tokens[j + 1]);
+          sum -= TokenPenalty(tokens[j + 1]);
+        }
         ++logits_pos;
-        ++count;
       }
+      const int score_count = ScoredTokenCount(input);
       (*scores)[i].average_logprob =
-          count > 0 ? sum / count : -std::numeric_limits<double>::infinity();
+          score_count > 0 ? sum / score_count
+                          : -std::numeric_limits<double>::infinity();
     }
     llama_batch_free(batch);
   }
 
-  double ScoreTokensWithCache(const vector<llama_token>& tokens) {
-    vector<vector<llama_token>> single{tokens};
+  double ScoreTokensWithCache(const TokenizedInput& input) {
+    vector<TokenizedInput> single{input};
     vector<PerplexityScore> scores(1);
     ScoreTokenBatchWithCache(single, 0, 1, &scores);
     return scores[0].average_logprob;
   }
 
-  void ScoreTokenBatchWithCache(const vector<vector<llama_token>>& tokenized,
+  void ScoreTokenBatchWithCache(const vector<TokenizedInput>& tokenized,
                                 size_t start,
                                 size_t end,
                                 vector<PerplexityScore>* scores) {
@@ -317,12 +353,14 @@ class LlamaCausalScorer : public PerplexityScorer {
     int total_decode_tokens = 0;
 
     for (size_t i = start; i < end; ++i) {
-      const auto& tokens = tokenized[i];
+      const auto& input = tokenized[i];
+      const auto& tokens = input.tokens;
       if (tokens.empty())
         continue;
       ScorePlan plan;
       plan.candidate_index = i;
       plan.tokens = &tokens;
+      plan.score_start = input.score_start;
 
       PrefixMatch match = FindLongestPrefix(tokens);
       RecordCacheLookup(match.matched_len);
@@ -332,9 +370,16 @@ class LlamaCausalScorer : public PerplexityScorer {
         plan.matched_len = match.matched_len;
         if (plan.matched_len == static_cast<int>(tokens.size())) {
           const auto& cached = prefix_cache_[match.cache_index];
+          const size_t score_start =
+              ScorePrefixSumStart(plan.score_start);
+          const double score_sum =
+              PrefixLogprobSum(cached, tokens.size()) -
+              PrefixLogprobSum(cached, score_start);
+          const int score_count =
+              ScoredTokenCount(tokens.size(), plan.score_start);
           (*scores)[i].average_logprob =
-              cached.token_count > 0
-                  ? cached.logprob_sum / cached.token_count
+              score_count > 0
+                  ? score_sum / score_count
                   : -std::numeric_limits<double>::infinity();
           plan.full_cache_hit = true;
           plans.push_back(plan);
@@ -357,7 +402,8 @@ class LlamaCausalScorer : public PerplexityScorer {
         plan.seq_id = AllocSeqId();
       }
       if (plan.seq_id < 0) {
-        (*scores)[i].average_logprob = ScoreTokensWithoutCache(tokens);
+        (*scores)[i].average_logprob =
+            ScoreTokensWithoutCache({tokens, plan.score_start});
         continue;
       }
 
@@ -395,7 +441,7 @@ class LlamaCausalScorer : public PerplexityScorer {
           continue;
         llama_memory_seq_rm(llama_get_memory(context_), plan.seq_id, -1, -1);
         (*scores)[plan.candidate_index].average_logprob =
-            ScoreTokensWithoutCache(*plan.tokens);
+            ScoreTokensWithoutCache({*plan.tokens, plan.score_start});
       }
       return;
     }
@@ -432,8 +478,15 @@ class LlamaCausalScorer : public PerplexityScorer {
       const double total_sum =
           plan.cached_logprob_sum + plan.suffix_logprob_sum;
       const int total_count = plan.cached_token_count + plan.suffix_token_count;
+      const size_t score_start =
+          ScorePrefixSumStart(plan.score_start);
+      const double score_sum =
+          prefix_sums[tokens.size()] -
+          prefix_sums[score_start];
+      const int score_count =
+          ScoredTokenCount(tokens.size(), plan.score_start);
       (*scores)[plan.candidate_index].average_logprob =
-          total_count > 0 ? total_sum / total_count
+          score_count > 0 ? score_sum / score_count
                           : -std::numeric_limits<double>::infinity();
       InsertOrReplacePrefix(plan.seq_id, tokens, std::move(prefix_sums),
                             total_sum, total_count);
@@ -441,10 +494,10 @@ class LlamaCausalScorer : public PerplexityScorer {
     llama_batch_free(batch);
   }
 
-  double ScoreTokensWithoutCache(const vector<llama_token>& tokens) {
+  double ScoreTokensWithoutCache(const TokenizedInput& input) {
     const int saved_capacity = prefix_cache_capacity_;
     prefix_cache_capacity_ = 0;
-    const double score = ScoreTokens(tokens);
+    const double score = ScoreTokens(input);
     llama_memory_clear(llama_get_memory(context_), true);
     prefix_cache_.clear();
     ResetSeqIds();

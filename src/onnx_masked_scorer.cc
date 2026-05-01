@@ -155,14 +155,14 @@ class OnnxMaskedScorer : public PerplexityScorer {
     vector<size_t> miss_indices;
     miss_indices.reserve(inputs.size());
     for (size_t i = 0; i < inputs.size(); ++i) {
-      if (cache_capacity_ > 0 && CacheGet(inputs[i].text, &scores[i]))
+      if (cache_capacity_ > 0 && CacheGet(CacheKey(inputs[i]), &scores[i]))
         continue;
       miss_indices.push_back(i);
     }
 
     vector<MaskTask> tasks;
     for (size_t i : miss_indices) {
-      AddTasksForInput(inputs[i].text, i, &tasks);
+      AddTasksForInput(inputs[i], i, &tasks);
     }
     for (size_t begin = 0; begin < tasks.size(); begin += batch_size_) {
       const size_t end = std::min(tasks.size(), begin + batch_size_);
@@ -174,7 +174,7 @@ class OnnxMaskedScorer : public PerplexityScorer {
         score.average_logprob /= score.token_count;
       }
       if (cache_capacity_ > 0)
-        CachePut(inputs[i].text, score);
+        CachePut(CacheKey(inputs[i]), score);
     }
     return scores;
   }
@@ -182,8 +182,12 @@ class OnnxMaskedScorer : public PerplexityScorer {
  private:
   using CacheList = std::list<std::pair<string, PerplexityScore>>;
 
-  bool CacheGet(const string& text, PerplexityScore* out) {
-    auto it = cache_index_.find(text);
+  static string CacheKey(const PerplexityInput& input) {
+    return input.context + "\x1f" + input.text;
+  }
+
+  bool CacheGet(const string& key, PerplexityScore* out) {
+    auto it = cache_index_.find(key);
     if (it == cache_index_.end())
       return false;
     cache_lru_.splice(cache_lru_.begin(), cache_lru_, it->second);
@@ -191,16 +195,16 @@ class OnnxMaskedScorer : public PerplexityScorer {
     return true;
   }
 
-  void CachePut(const string& text, const PerplexityScore& score) {
+  void CachePut(const string& key, const PerplexityScore& score) {
     if (cache_capacity_ == 0)
       return;
-    auto it = cache_index_.find(text);
+    auto it = cache_index_.find(key);
     if (it != cache_index_.end()) {
       it->second->second = score;
       cache_lru_.splice(cache_lru_.begin(), cache_lru_, it->second);
       return;
     }
-    cache_lru_.emplace_front(text, score);
+    cache_lru_.emplace_front(key, score);
     cache_index_[cache_lru_.front().first] = cache_lru_.begin();
     while (cache_lru_.size() > cache_capacity_) {
       cache_index_.erase(cache_lru_.back().first);
@@ -267,26 +271,41 @@ class OnnxMaskedScorer : public PerplexityScorer {
                      name) != input_name_storage_.end();
   }
 
-  void AddTasksForInput(const string& text,
+  void AddTasksForInput(const PerplexityInput& input,
                         size_t input_index,
                         vector<MaskTask>* tasks) const {
     const int max_content_tokens = std::max(1, max_length_ - 2);
-    BertTokenizedText tokenized;
+    BertTokenizedText context_tokens;
+    BertTokenizedText target_tokens;
     try {
-      tokenized = tokenizer_.Tokenize(text, max_content_tokens);
+      context_tokens = tokenizer_.Tokenize(input.context, max_content_tokens);
+      target_tokens = tokenizer_.Tokenize(input.text, max_content_tokens);
     } catch (const std::exception& e) {
       LOG(ERROR) << "perplexity: masked tokenize threw on text=\""
-                 << text.substr(0, 64) << "\": " << e.what();
+                 << input.text.substr(0, 64) << "\": " << e.what();
       return;
     }
-    if (tokenized.tokens.empty())
+    if (target_tokens.tokens.empty())
       return;
+    const size_t context_limit =
+        static_cast<size_t>(std::max(0, max_content_tokens -
+                                            static_cast<int>(
+                                                target_tokens.tokens.size())));
+    if (context_tokens.tokens.size() > context_limit) {
+      const size_t drop = context_tokens.tokens.size() - context_limit;
+      context_tokens.tokens.erase(
+          context_tokens.tokens.begin(), context_tokens.tokens.begin() + drop);
+    }
     vector<int64> base;
-    base.reserve(tokenized.tokens.size() + 2);
+    base.reserve(context_tokens.tokens.size() + target_tokens.tokens.size() + 2);
     base.push_back(tokenizer_.cls_id());
-    base.insert(base.end(), tokenized.tokens.begin(), tokenized.tokens.end());
+    base.insert(base.end(), context_tokens.tokens.begin(),
+                context_tokens.tokens.end());
+    const size_t target_start = base.size();
+    base.insert(base.end(), target_tokens.tokens.begin(),
+                target_tokens.tokens.end());
     base.push_back(tokenizer_.sep_id());
-    for (size_t pos = 1; pos + 1 < base.size(); ++pos) {
+    for (size_t pos = target_start; pos + 1 < base.size(); ++pos) {
       MaskTask task;
       task.input_index = input_index;
       task.mask_pos = static_cast<int>(pos);

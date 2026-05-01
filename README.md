@@ -117,9 +117,12 @@ perplexity:
   batch_size: 32
   cache_size: 0
   score_weight: 60.0
+  scan_size: 50
+  rank_size: 20
   top_k: 2
-  candidate_types:
+  rank_types:
     - sentence
+  history_context_commits: 0
 ```
 
 `perplexity/model` can be an absolute path or a Rime resource path such as
@@ -140,8 +143,11 @@ perplexity:
 | `perplexity/unknown_token_penalty` | `0.0` | Penalty for unknown / byte-fallback tokens. |
 | `perplexity/score_prefix` | `，` | Optional text or special token prepended before scoring. |
 | `perplexity/score_suffix` | `，` | Optional text or special token appended before scoring. |
-| `perplexity/candidate_types` | `[sentence]` | Candidate types to rerank. |
-| `perplexity/top_k` | `2` | Number of reranked candidates to promote. |
+| `perplexity/scan_size` | `50` | Number of upstream candidates to scan. |
+| `perplexity/rank_size` | `20` | Maximum number of rankable candidates visible to the LM scorer. |
+| `perplexity/rank_types` | `[sentence]` | Candidate types to rerank. |
+| `perplexity/top_k` | `2` | Output cap for reranked candidates kept in rankable slots. |
+| `perplexity/history_context_commits` | `0` | Recent commit-history records used as scoring context. |
 
 Check Rime logs for `perplexity: loaded causal LM`.
 

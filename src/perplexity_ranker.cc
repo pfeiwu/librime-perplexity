@@ -10,6 +10,7 @@
 #include <cmath>
 #include <numeric>
 #include <rime/candidate.h>
+#include <rime/commit_history.h>
 #include <rime/config.h>
 #include <rime/context.h>
 #include <rime/engine.h>
@@ -24,7 +25,6 @@ namespace rime {
 namespace {
 
 const ResourceType kModelFileType = {"perplexity_model", "", ""};
-constexpr size_t kMaxDrainRankableCandidates = 256;
 
 static string NormalizeModelType(string value) {
   std::replace(value.begin(), value.end(), '-', '_');
@@ -126,18 +126,25 @@ PerplexityRanker::PerplexityRanker(const Ticket& ticket)
     return;
   if (Config* config = engine_->schema()->config()) {
     config->GetInt(name_space_ + "/top_k", &top_k_);
+    config->GetInt(name_space_ + "/scan_size", &scan_size_);
+    config->GetInt(name_space_ + "/rank_size", &rank_size_);
+    config->GetInt(name_space_ + "/history_context_commits",
+                   &history_context_commits_);
     config->GetDouble(name_space_ + "/score_weight", &score_weight_);
-    if (auto types = config->GetList(name_space_ + "/candidate_types")) {
+    if (auto types = config->GetList(name_space_ + "/rank_types")) {
       for (auto it = types->begin(); it != types->end(); ++it) {
         if (auto value = As<ConfigValue>(*it)) {
-          candidate_types_.insert(value->str());
+          rank_types_.insert(value->str());
         }
       }
     }
     scorer_ = CreateScorer(config, name_space_);
   }
-  if (candidate_types_.empty())
-    candidate_types_.insert("sentence");
+  if (rank_types_.empty())
+    rank_types_.insert("sentence");
+  scan_size_ = std::max(0, scan_size_);
+  rank_size_ = std::max(0, rank_size_);
+  history_context_commits_ = std::max(0, history_context_commits_);
 }
 
 bool PerplexityRanker::AppliesToSegment(Segment* segment) {
@@ -145,7 +152,33 @@ bool PerplexityRanker::AppliesToSegment(Segment* segment) {
 }
 
 bool PerplexityRanker::IsRankableCandidate(const an<Candidate>& cand) const {
-  return cand && candidate_types_.count(cand->type());
+  return cand && rank_types_.count(cand->type());
+}
+
+string PerplexityRanker::BuildHistoryContext() const {
+  if (!engine_ || history_context_commits_ <= 0)
+    return string();
+  Context* context = engine_->context();
+  if (!context)
+    return string();
+  const CommitHistory& history = context->commit_history();
+  if (history.empty())
+    return string();
+
+  vector<string> records;
+  records.reserve(static_cast<size_t>(history_context_commits_));
+  for (auto it = history.rbegin();
+       it != history.rend() &&
+       records.size() < static_cast<size_t>(history_context_commits_);
+       ++it) {
+    if (!it->text.empty())
+      records.push_back(it->text);
+  }
+
+  string result;
+  for (auto it = records.rbegin(); it != records.rend(); ++it)
+    result += *it;
+  return result;
 }
 
 an<Translation> PerplexityRanker::Apply(an<Translation> translation,
@@ -153,31 +186,33 @@ an<Translation> PerplexityRanker::Apply(an<Translation> translation,
   if (!translation || translation->exhausted())
     return translation;
 
-  const bool should_rank = scorer_ && scorer_->Ready() && top_k_ > 0;
+  const bool should_rank =
+      scorer_ && scorer_->Ready() && top_k_ > 0 && scan_size_ > 0 &&
+      rank_size_ > 0;
   if (!should_rank)
     return translation;
 
   vector<an<Candidate>> rankable;
-  rankable.reserve(kMaxDrainRankableCandidates);
-  while (rankable.size() < kMaxDrainRankableCandidates &&
+  vector<an<Candidate>> scanned;
+  rankable.reserve(static_cast<size_t>(rank_size_));
+  scanned.reserve(static_cast<size_t>(scan_size_));
+  while (scanned.size() < static_cast<size_t>(scan_size_) &&
+         rankable.size() < static_cast<size_t>(rank_size_) &&
          !translation->exhausted()) {
     auto cand = translation->Peek();
-    if (!IsRankableCandidate(cand))
-      break;
-    rankable.push_back(cand);
+    scanned.push_back(cand);
+    if (IsRankableCandidate(cand))
+      rankable.push_back(cand);
     translation->Next();
   }
-  if (rankable.size() == kMaxDrainRankableCandidates && !translation->exhausted()) {
-    LOG(WARNING) << "perplexity: stopped draining after "
-                 << kMaxDrainRankableCandidates << " rankable candidates";
-  }
   if (rankable.empty())
-    return translation;
+    return TranslationFromCandidates(scanned, translation);
 
+  const string history_context = BuildHistoryContext();
   vector<PerplexityInput> inputs;
   inputs.reserve(rankable.size());
   for (const auto& cand : rankable) {
-    inputs.push_back({cand->text(), GetCandidateUnits(cand)});
+    inputs.push_back({history_context, cand->text(), GetCandidateUnits(cand)});
   }
 
   const auto start = std::chrono::steady_clock::now();
@@ -186,7 +221,10 @@ an<Translation> PerplexityRanker::Apply(an<Translation> translation,
   const auto elapsed_ms =
       std::chrono::duration_cast<std::chrono::milliseconds>(finish - start)
           .count();
-  LOG(INFO) << "perplexity: candidates=" << rankable.size()
+  LOG(INFO) << "perplexity: scanned=" << scanned.size()
+            << " rankable=" << rankable.size()
+            << " history_context_commits=" << history_context_commits_
+            << " history_context_chars=" << history_context.size()
             << " scoring=" << elapsed_ms << "ms";
 
   vector<double> base_scores(rankable.size(), 0.0);
@@ -231,16 +269,30 @@ an<Translation> PerplexityRanker::Apply(an<Translation> translation,
               << " text=" << rankable[index]->text();
   }
 
-  vector<an<Candidate>> reranked;
-  reranked.reserve(static_cast<size_t>(top_k_));
+  vector<an<Candidate>> ranked;
+  ranked.reserve(static_cast<size_t>(top_k_));
   const size_t promote_count =
       std::min(order.size(), static_cast<size_t>(top_k_));
   for (size_t i = 0; i < promote_count; ++i) {
     const size_t index = order[i];
-    reranked.push_back(rankable[index]);
+    ranked.push_back(rankable[index]);
   }
 
-  return TranslationFromCandidates(reranked, translation);
+  vector<an<Candidate>> output;
+  output.reserve(scanned.size());
+  size_t ranked_pos = 0;
+  for (const auto& cand : scanned) {
+    if (!cand)
+      continue;
+    if (IsRankableCandidate(cand)) {
+      if (ranked_pos < ranked.size())
+        output.push_back(ranked[ranked_pos++]);
+    } else {
+      output.push_back(cand);
+    }
+  }
+
+  return TranslationFromCandidates(output, translation);
 }
 
 }  // namespace rime

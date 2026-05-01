@@ -18,6 +18,7 @@ enum class PerplexityModelType {
 };
 
 struct PerplexityInput {
+  string context;
   string text;
   vector<string> units;
 };
