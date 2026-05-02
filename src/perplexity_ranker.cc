@@ -75,6 +75,12 @@ static vector<string> GetCandidateUnits(const an<Candidate>& cand) {
   return units;
 }
 
+static size_t GetCandidateInputSize(const an<Candidate>& cand) {
+  if (!cand || cand->end() < cand->start())
+    return 0;
+  return cand->end() - cand->start();
+}
+
 static an<Translation> TranslationFromCandidates(
     const vector<an<Candidate>>& candidates,
     an<Translation> remaining) {
@@ -128,6 +134,7 @@ PerplexityRanker::PerplexityRanker(const Ticket& ticket)
     config->GetInt(name_space_ + "/top_k", &top_k_);
     config->GetInt(name_space_ + "/scan_size", &scan_size_);
     config->GetInt(name_space_ + "/rank_size", &rank_size_);
+    config->GetInt(name_space_ + "/min_input_size", &min_input_size_);
     config->GetInt(name_space_ + "/history_context_commits",
                    &history_context_commits_);
     config->GetDouble(name_space_ + "/score_weight", &score_weight_);
@@ -142,8 +149,10 @@ PerplexityRanker::PerplexityRanker(const Ticket& ticket)
   }
   if (rank_types_.empty())
     rank_types_.insert("sentence");
+  top_k_ = std::max(0, top_k_);
   scan_size_ = std::max(0, scan_size_);
   rank_size_ = std::max(0, rank_size_);
+  min_input_size_ = std::max(0, min_input_size_);
   history_context_commits_ = std::max(0, history_context_commits_);
 }
 
@@ -152,7 +161,24 @@ bool PerplexityRanker::AppliesToSegment(Segment* segment) {
 }
 
 bool PerplexityRanker::IsRankableCandidate(const an<Candidate>& cand) const {
-  return cand && rank_types_.count(cand->type());
+  if (!cand)
+    return false;
+  auto genuine = Candidate::GetGenuineCandidate(cand);
+  return genuine && rank_types_.count(genuine->type());
+}
+
+size_t PerplexityRanker::CurrentInputSize() const {
+  if (!engine_)
+    return 0;
+  Context* context = engine_->context();
+  if (!context)
+    return 0;
+  const Composition& composition = context->composition();
+  if (!composition.empty()) {
+    const Segment& segment = composition.back();
+    return segment.end >= segment.start ? segment.end - segment.start : 0;
+  }
+  return context->input().length();
 }
 
 string PerplexityRanker::BuildHistoryContext() const {
@@ -187,8 +213,8 @@ an<Translation> PerplexityRanker::Apply(an<Translation> translation,
     return translation;
 
   const bool should_rank =
-      scorer_ && scorer_->Ready() && top_k_ > 0 && scan_size_ > 0 &&
-      rank_size_ > 0;
+      scorer_ && scorer_->Ready() && scan_size_ > 0 && rank_size_ > 0 &&
+      CurrentInputSize() >= static_cast<size_t>(min_input_size_);
   if (!should_rank)
     return translation;
 
@@ -223,6 +249,8 @@ an<Translation> PerplexityRanker::Apply(an<Translation> translation,
           .count();
   LOG(INFO) << "perplexity: scanned=" << scanned.size()
             << " rankable=" << rankable.size()
+            << " input_size=" << CurrentInputSize()
+            << " min_input_size=" << min_input_size_
             << " history_context_commits=" << history_context_commits_
             << " history_context_chars=" << history_context.size()
             << " scoring=" << elapsed_ms << "ms";
@@ -244,6 +272,10 @@ an<Translation> PerplexityRanker::Apply(an<Translation> translation,
   vector<size_t> order(rankable.size());
   std::iota(order.begin(), order.end(), 0);
   std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+    const size_t input_size_a = GetCandidateInputSize(rankable[a]);
+    const size_t input_size_b = GetCandidateInputSize(rankable[b]);
+    if (input_size_a != input_size_b)
+      return input_size_a > input_size_b;
     const double score_a = combined_score(a);
     const double score_b = combined_score(b);
     if (score_a != score_b)
@@ -258,6 +290,7 @@ an<Translation> PerplexityRanker::Apply(an<Translation> translation,
         index < lm_scores.size()
             ? lm_scores[index].average_logprob
             : -std::numeric_limits<double>::infinity();
+    auto genuine = Candidate::GetGenuineCandidate(rankable[index]);
     LOG(INFO) << "perplexity_score rank=" << (rank + 1)
               << " src_rank=" << (index + 1)
               << " llm=" << lm
@@ -265,14 +298,17 @@ an<Translation> PerplexityRanker::Apply(an<Translation> translation,
               << " total=" << combined_score(index)
               << " tokens="
               << (index < lm_scores.size() ? lm_scores[index].token_count : 0)
-              << " type=" << rankable[index]->type()
+              << " input_size=" << GetCandidateInputSize(rankable[index])
+              << " type=" << (genuine ? genuine->type() : string())
+              << " outer_type=" << rankable[index]->type()
               << " text=" << rankable[index]->text();
   }
 
   vector<an<Candidate>> ranked;
-  ranked.reserve(static_cast<size_t>(top_k_));
   const size_t promote_count =
-      std::min(order.size(), static_cast<size_t>(top_k_));
+      top_k_ > 0 ? std::min(order.size(), static_cast<size_t>(top_k_))
+                 : order.size();
+  ranked.reserve(promote_count);
   for (size_t i = 0; i < promote_count; ++i) {
     const size_t index = order[i];
     ranked.push_back(rankable[index]);

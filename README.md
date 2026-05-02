@@ -93,7 +93,7 @@ perplexity:
   device: cpu
   batch_size: 32
   score_weight: 60.0
-  top_k: 2
+  top_k: 0
 ```
 
 ## Schema
@@ -119,7 +119,8 @@ perplexity:
   score_weight: 60.0
   scan_size: 50
   rank_size: 20
-  top_k: 2
+  min_input_size: 0
+  top_k: 0
   rank_types:
     - sentence
   history_context_commits: 0
@@ -145,8 +146,9 @@ perplexity:
 | `perplexity/score_suffix` | `，` | Optional text or special token appended before scoring. |
 | `perplexity/scan_size` | `50` | Number of upstream candidates to scan. |
 | `perplexity/rank_size` | `20` | Maximum number of rankable candidates visible to the LM scorer. |
+| `perplexity/min_input_size` | `0` | Minimum current input segment length required before scoring; `0` disables this gate. |
 | `perplexity/rank_types` | `[sentence]` | Candidate types to rerank. |
-| `perplexity/top_k` | `2` | Output cap for reranked candidates kept in rankable slots. |
+| `perplexity/top_k` | `0` | Output cap for reranked candidates kept in rankable slots; `0` keeps all rankable candidates collected by `rank_size`. |
 | `perplexity/history_context_commits` | `0` | Recent commit-history records used as scoring context. |
 
 Check Rime logs for `perplexity: loaded causal LM`.

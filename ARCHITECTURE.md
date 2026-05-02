@@ -32,7 +32,8 @@ perplexity:
   score_weight: 60.0
   scan_size: 50
   rank_size: 20
-  top_k: 2
+  min_input_size: 0
+  top_k: 0
   history_context_commits: 0
   unknown_token_penalty: 0.0
 ```
@@ -51,11 +52,12 @@ script_translator
   -> candidates
   -> PerplexityRanker
        scan a bounded upstream candidate window
-       collect rankable candidates by Candidate::type()
+       collect rankable candidates by genuine Candidate::type()
        build PerplexityInput{context, text, units}
        call PerplexityScorer::Score(batch)
-       compute lm_score * score_weight + Phrase::weight()
-       fill original rankable slots with up to top_k reranked candidates
+       compute lm_score * score_weight + base score
+       sort by input span length first, then score
+       fill original rankable slots with reranked candidates
        keep scanned non-rankable candidates in place
        append the upstream tail
   -> menu
@@ -71,9 +73,11 @@ script_translator
     the history text itself.
   - Computes base grammar score from `Phrase::weight()`.
   - Calls a scorer once with a batch of candidate texts.
-  - Sorts by `lm_average_logprob * score_weight + base_score`.
-  - Fills the original rankable slots with up to `top_k` reranked candidates
-    and drops the remaining scored rankable candidates.
+  - Sorts by input span length descending, then by
+    `lm_average_logprob * score_weight + base_score`.
+  - Fills the original rankable slots with reranked candidates.  If `top_k`
+    is positive, it caps the kept rankable candidates; if `top_k` is `0`, all
+    scored rankable candidates are kept.
 
 - `PerplexityScorer`
   - Model-family abstraction.
@@ -209,8 +213,9 @@ All parameters apply to both `causal` and `masked` model types unless noted.
 | `perplexity/score_suffix` | `，` | Optional text or special token appended before scoring. |
 | `perplexity/scan_size` | `50` | Number of upstream candidates to scan. |
 | `perplexity/rank_size` | `20` | Maximum number of rankable candidates visible to the LM scorer. |
+| `perplexity/min_input_size` | `0` | Minimum current input segment length required before scoring; `0` disables this gate. |
 | `perplexity/rank_types` | `[sentence]` | Candidate types this filter reranks. |
-| `perplexity/top_k` | `2` | Output cap for reranked candidates kept in rankable slots. |
+| `perplexity/top_k` | `0` | Output cap for reranked candidates kept in rankable slots; `0` keeps all rankable candidates collected by `rank_size`. |
 | `perplexity/history_context_commits` | `0` | Recent commit-history records used as scoring context. |
 
 ## Scorer Families
