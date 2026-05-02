@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <limits>
 #include <numeric>
 #include <rime/candidate.h>
 #include <rime/commit_history.h>
@@ -50,10 +51,91 @@ static int GpuLayersForDevice(const string& device) {
 
 static double GetBaseScore(const an<Candidate>& cand) {
   auto genuine = Candidate::GetGenuineCandidate(cand);
-  if (auto phrase = As<Phrase>(genuine)) {
-    return phrase->weight();
+  if (auto sentence = As<Sentence>(genuine)) {
+    return sentence->weight();
   }
   return cand ? cand->quality() : 0.0;
+}
+
+struct RankScore {
+  double base = 0.0;
+  double lm = -std::numeric_limits<double>::infinity();
+  double base_norm = 0.5;
+  double lm_norm = 0.5;
+  double adjusted_quality = 0.5;
+};
+
+static double NormalizeWithinRange(double value, double min, double max) {
+  if (max == min)
+    return 0.5;
+  return (value - min) / (max - min);
+}
+
+static bool SameInputSpan(const an<Candidate>& a, const an<Candidate>& b) {
+  if (!a || !b)
+    return false;
+  return a->start() == b->start() && a->end() == b->end();
+}
+
+static void BlendScoresForSpanGroup(const vector<an<Candidate>>& rankable,
+                                    const vector<PerplexityScore>& lm_scores,
+                                    double score_weight,
+                                    size_t start,
+                                    vector<bool>* visited,
+                                    vector<RankScore>* scores) {
+  vector<size_t> group;
+  for (size_t i = start; i < rankable.size(); ++i) {
+    if ((*visited)[i] || !SameInputSpan(rankable[start], rankable[i]))
+      continue;
+    (*visited)[i] = true;
+    group.push_back(i);
+  }
+
+  double base_min = std::numeric_limits<double>::infinity();
+  double base_max = -std::numeric_limits<double>::infinity();
+  double lm_min = std::numeric_limits<double>::infinity();
+  double lm_max = -std::numeric_limits<double>::infinity();
+  bool has_lm = false;
+  for (size_t index : group) {
+    RankScore& score = (*scores)[index];
+    score.base = GetBaseScore(rankable[index]);
+    score.lm = index < lm_scores.size()
+                   ? lm_scores[index].average_logprob
+                   : -std::numeric_limits<double>::infinity();
+    base_min = std::min(base_min, score.base);
+    base_max = std::max(base_max, score.base);
+    if (std::isfinite(score.lm)) {
+      lm_min = std::min(lm_min, score.lm);
+      lm_max = std::max(lm_max, score.lm);
+      has_lm = true;
+    }
+  }
+
+  for (size_t index : group) {
+    RankScore& score = (*scores)[index];
+    score.base_norm = NormalizeWithinRange(score.base, base_min, base_max);
+    score.lm_norm =
+        has_lm && std::isfinite(score.lm)
+            ? NormalizeWithinRange(score.lm, lm_min, lm_max)
+            : score.base_norm;
+    score.adjusted_quality =
+        (1.0 - score_weight) * score.base_norm + score_weight * score.lm_norm;
+  }
+}
+
+static vector<RankScore> ComputeAdjustedQuality(
+    const vector<an<Candidate>>& rankable,
+    const vector<PerplexityScore>& lm_scores,
+    double score_weight) {
+  vector<RankScore> scores(rankable.size());
+  vector<bool> visited(rankable.size(), false);
+  for (size_t i = 0; i < rankable.size(); ++i) {
+    if (!visited[i]) {
+      BlendScoresForSpanGroup(rankable, lm_scores, score_weight, i, &visited,
+                              &scores);
+    }
+  }
+  return scores;
 }
 
 static vector<string> GetCandidateUnits(const an<Candidate>& cand) {
@@ -154,6 +236,7 @@ PerplexityRanker::PerplexityRanker(const Ticket& ticket)
   rank_size_ = std::max(0, rank_size_);
   min_input_size_ = std::max(0, min_input_size_);
   history_context_commits_ = std::max(0, history_context_commits_);
+  score_weight_ = std::max(0.0, std::min(1.0, score_weight_));
 }
 
 bool PerplexityRanker::AppliesToSegment(Segment* segment) {
@@ -251,36 +334,22 @@ an<Translation> PerplexityRanker::Apply(an<Translation> translation,
             << " rankable=" << rankable.size()
             << " input_size=" << CurrentInputSize()
             << " min_input_size=" << min_input_size_
+            << " score_weight=" << score_weight_
             << " history_context_commits=" << history_context_commits_
             << " history_context_chars=" << history_context.size()
             << " scoring=" << elapsed_ms << "ms";
 
-  vector<double> base_scores(rankable.size(), 0.0);
-  for (size_t i = 0; i < rankable.size(); ++i) {
-    base_scores[i] = GetBaseScore(rankable[i]);
-  }
-
-  auto combined_score = [&](size_t index) {
-    double lm = index < lm_scores.size()
-                    ? lm_scores[index].average_logprob
-                    : -std::numeric_limits<double>::infinity();
-    if (!std::isfinite(lm))
-      return base_scores[index];
-    return lm * score_weight_ + base_scores[index];
-  };
+  const vector<RankScore> rank_scores =
+      ComputeAdjustedQuality(rankable, lm_scores, score_weight_);
 
   vector<size_t> order(rankable.size());
   std::iota(order.begin(), order.end(), 0);
   std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) {
-    const size_t input_size_a = GetCandidateInputSize(rankable[a]);
-    const size_t input_size_b = GetCandidateInputSize(rankable[b]);
-    if (input_size_a != input_size_b)
-      return input_size_a > input_size_b;
-    const double score_a = combined_score(a);
-    const double score_b = combined_score(b);
-    if (score_a != score_b)
-      return score_a > score_b;
-    return base_scores[a] > base_scores[b];
+    const size_t len_a = GetCandidateInputSize(rankable[a]);
+    const size_t len_b = GetCandidateInputSize(rankable[b]);
+    if (len_a != len_b)
+      return len_a > len_b;
+    return rank_scores[a].adjusted_quality > rank_scores[b].adjusted_quality;
   });
 
   const size_t debug_count = std::min(order.size(), static_cast<size_t>(20));
@@ -294,8 +363,10 @@ an<Translation> PerplexityRanker::Apply(an<Translation> translation,
     LOG(INFO) << "perplexity_score rank=" << (rank + 1)
               << " src_rank=" << (index + 1)
               << " llm=" << lm
-              << " base=" << base_scores[index]
-              << " total=" << combined_score(index)
+              << " lm_norm=" << rank_scores[index].lm_norm
+              << " base=" << rank_scores[index].base
+              << " base_norm=" << rank_scores[index].base_norm
+              << " adjusted_quality=" << rank_scores[index].adjusted_quality
               << " tokens="
               << (index < lm_scores.size() ? lm_scores[index].token_count : 0)
               << " input_size=" << GetCandidateInputSize(rankable[index])

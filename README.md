@@ -92,7 +92,7 @@ perplexity:
   model: models/bert-base-chinese/model.onnx
   device: cpu
   batch_size: 32
-  score_weight: 60.0
+  score_weight: 0.5
   top_k: 0
 ```
 
@@ -116,7 +116,7 @@ perplexity:
   device: cpu
   batch_size: 32
   cache_size: 0
-  score_weight: 60.0
+  score_weight: 0.5
   scan_size: 50
   rank_size: 20
   min_input_size: 0
@@ -140,7 +140,7 @@ perplexity:
 | `perplexity/max_length` | `1024` | Maximum causal context or masked sequence length. |
 | `perplexity/batch_size` | `32` | Causal candidate batch size, or masked-token copy batch size. |
 | `perplexity/cache_size` | `0` | LRU capacity. Causal: prefix KV cache entries; masked: sentence score cache entries. `0` disables caching. |
-| `perplexity/score_weight` | `1.0` | LM score weight. |
+| `perplexity/score_weight` | `1.0` | Blend ratio in `[0.0, 1.0]`: `0.0` keeps base ordering, `1.0` uses LM ordering among candidates with the same input span. Longer input spans still rank first. |
 | `perplexity/unknown_token_penalty` | `0.0` | Penalty for unknown / byte-fallback tokens. |
 | `perplexity/score_prefix` | `，` | Optional text or special token prepended before scoring. |
 | `perplexity/score_suffix` | `，` | Optional text or special token appended before scoring. |

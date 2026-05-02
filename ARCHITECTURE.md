@@ -29,7 +29,7 @@ perplexity:
   max_length: 1024
   batch_size: 32
   cache_size: 0
-  score_weight: 60.0
+  score_weight: 0.5
   scan_size: 50
   rank_size: 20
   min_input_size: 0
@@ -55,8 +55,9 @@ script_translator
        collect rankable candidates by genuine Candidate::type()
        build PerplexityInput{context, text, units}
        call PerplexityScorer::Score(batch)
-       compute lm_score * score_weight + base score
-       sort by input span length first, then score
+       normalize base and LM scores by input span
+       compute adjusted scores in a side table
+       sort by input span length first, then adjusted score
        fill original rankable slots with reranked candidates
        keep scanned non-rankable candidates in place
        append the upstream tail
@@ -71,10 +72,19 @@ script_translator
     is rankable.
   - Can use recent commit-history records as scoring context without scoring
     the history text itself.
-  - Computes base grammar score from `Phrase::weight()`.
+  - Uses `Candidate::quality()` as the base ordering signal, except sentence
+    candidates use `Sentence::weight()` because Rime sentence generation keeps
+    its path score there and does not normally populate candidate quality.
   - Calls a scorer once with a batch of candidate texts.
-  - Sorts by input span length descending, then by
-    `lm_average_logprob * score_weight + base_score`.
+  - Groups rankable candidates by input span, min-max normalizes the base score
+    and LM average log probability inside each group, then computes an adjusted
+    score in a side table:
+    `(1 - score_weight) * base_norm + score_weight * lm_norm`.
+  - Does not write the adjusted score back to `Candidate::quality()`;
+    downstream filters still see the upstream candidate quality scale.
+  - Sorts reranked candidates by covered input span length descending, then by
+    adjusted score descending. This preserves the IME expectation that fuller
+    input coverage wins before LM preference is considered.
   - Fills the original rankable slots with reranked candidates.  If `top_k`
     is positive, it caps the kept rankable candidates; if `top_k` is `0`, all
     scored rankable candidates are kept.
@@ -207,7 +217,7 @@ All parameters apply to both `causal` and `masked` model types unless noted.
 | `perplexity/max_length` | `1024` | Maximum causal context or masked sequence length. |
 | `perplexity/batch_size` | `32` | Maximum causal candidate batch size or masked-token copy batch size. |
 | `perplexity/cache_size` | `0` | LRU capacity. Causal: prefix KV cache entries; masked: complete sentence score entries. `0` disables caching. |
-| `perplexity/score_weight` | `1.0` | Multiplier for LM average log probability before adding base score. |
+| `perplexity/score_weight` | `1.0` | Blend ratio in `[0.0, 1.0]`: `0.0` keeps base ordering, `1.0` uses LM ordering among candidates with the same input span. Longer input spans still rank first. |
 | `perplexity/unknown_token_penalty` | `0.0` | Penalty for unknown or byte-fallback tokens. |
 | `perplexity/score_prefix` | `，` | Optional text or special token prepended before scoring. |
 | `perplexity/score_suffix` | `，` | Optional text or special token appended before scoring. |
