@@ -120,7 +120,8 @@ class LlamaCausalScorer : public PerplexityScorer {
 
     vector<TokenizedInput> tokenized(inputs.size());
     for (size_t i = 0; i < inputs.size(); ++i) {
-      const string prefix = inputs[i].context + score_prefix_;
+      const string prefix =
+          inputs[i].context.empty() ? score_prefix_ : inputs[i].context;
       auto prefix_tokens = Tokenize(prefix);
       auto tokens = Tokenize(prefix + inputs[i].text + score_suffix_);
       const int score_start = static_cast<int>(prefix_tokens.size());
