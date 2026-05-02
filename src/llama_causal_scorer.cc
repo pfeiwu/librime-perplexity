@@ -11,6 +11,8 @@
 #include <limits>
 
 #ifdef RIME_PERPLEXITY_ENABLE_LLAMA
+#include <ggml-backend.h>
+#include <ggml-cpu.h>
 #include <llama.h>
 #endif
 
@@ -52,6 +54,23 @@ static size_t ScorePrefixSumStart(int score_start) {
   return static_cast<size_t>(std::max(0, score_start));
 }
 
+static ggml_backend_dev_t LoadBackendsForGpuLayers(int gpu_layers) {
+  if (gpu_layers != 0) {
+    ggml_backend_load_all();
+    return nullptr;
+  }
+
+  if (!ggml_backend_reg_by_name("CPU")) {
+    ggml_backend_register(ggml_backend_cpu_reg());
+  }
+  ggml_backend_dev_t cpu_dev =
+      ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+  if (!cpu_dev) {
+    LOG(ERROR) << "perplexity: failed to load llama.cpp CPU backend";
+  }
+  return cpu_dev;
+}
+
 class LlamaCausalScorer : public PerplexityScorer {
  public:
   explicit LlamaCausalScorer(const PerplexityScorerOptions& options)
@@ -60,10 +79,15 @@ class LlamaCausalScorer : public PerplexityScorer {
         unknown_token_penalty_(std::max(0.0, options.unknown_token_penalty)),
         score_prefix_(options.score_prefix),
         score_suffix_(options.score_suffix) {
-    ggml_backend_load_all();
+    ggml_backend_dev_t cpu_dev =
+        LoadBackendsForGpuLayers(options.gpu_layers);
 
     llama_model_params model_params = llama_model_default_params();
     model_params.n_gpu_layers = options.gpu_layers;
+    ggml_backend_dev_t cpu_devices[] = {cpu_dev, nullptr};
+    if (cpu_dev) {
+      model_params.devices = cpu_devices;
+    }
     model_ =
         llama_model_load_from_file(options.model_path.c_str(), model_params);
     if (!model_) {
