@@ -295,18 +295,22 @@ an<Translation> PerplexityRanker::Apply(an<Translation> translation,
   if (!translation || translation->exhausted())
     return translation;
 
-  const bool should_rank =
-      scorer_ && scorer_->Ready() && scan_size_ > 0 && rank_size_ > 0 &&
-      CurrentInputSize() >= static_cast<size_t>(min_input_size_);
-  if (!should_rank)
+  const bool input_ready =
+      scan_size_ > 0 && CurrentInputSize() >= static_cast<size_t>(min_input_size_);
+  if (!input_ready)
+    return translation;
+  const bool should_score = rank_size_ > 0;
+  if (should_score && !(scorer_ && scorer_->Ready()))
+    return translation;
+  if (!should_score && top_k_ == 0)
     return translation;
 
   vector<an<Candidate>> rankable;
   vector<an<Candidate>> scanned;
-  rankable.reserve(static_cast<size_t>(rank_size_));
+  rankable.reserve(static_cast<size_t>(should_score ? rank_size_ : scan_size_));
   scanned.reserve(static_cast<size_t>(scan_size_));
   while (scanned.size() < static_cast<size_t>(scan_size_) &&
-         rankable.size() < static_cast<size_t>(rank_size_) &&
+         (!should_score || rankable.size() < static_cast<size_t>(rank_size_)) &&
          !translation->exhausted()) {
     auto cand = translation->Peek();
     scanned.push_back(cand);
@@ -316,6 +320,24 @@ an<Translation> PerplexityRanker::Apply(an<Translation> translation,
   }
   if (rankable.empty())
     return TranslationFromCandidates(scanned, translation);
+
+  if (!should_score) {
+    vector<an<Candidate>> output;
+    output.reserve(scanned.size());
+    size_t kept = 0;
+    for (const auto& cand : scanned) {
+      if (!cand)
+        continue;
+      if (IsRankableCandidate(cand)) {
+        if (kept < static_cast<size_t>(top_k_))
+          output.push_back(cand);
+        ++kept;
+      } else {
+        output.push_back(cand);
+      }
+    }
+    return TranslationFromCandidates(output, translation);
+  }
 
   const string history_context = BuildHistoryContext();
   vector<PerplexityInput> inputs;
