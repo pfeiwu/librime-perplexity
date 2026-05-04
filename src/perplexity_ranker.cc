@@ -265,28 +265,46 @@ size_t PerplexityRanker::CurrentInputSize() const {
 }
 
 string PerplexityRanker::BuildHistoryContext() const {
-  if (!engine_ || history_context_commits_ <= 0)
+  if (!engine_)
     return string();
   Context* context = engine_->context();
   if (!context)
     return string();
-  const CommitHistory& history = context->commit_history();
-  if (history.empty())
-    return string();
 
   vector<string> records;
-  records.reserve(static_cast<size_t>(history_context_commits_));
-  for (auto it = history.rbegin();
-       it != history.rend() &&
-       records.size() < static_cast<size_t>(history_context_commits_);
-       ++it) {
-    if (!it->text.empty())
-      records.push_back(it->text);
+  if (history_context_commits_ > 0) {
+    const CommitHistory& history = context->commit_history();
+    records.reserve(static_cast<size_t>(history_context_commits_));
+    for (auto it = history.rbegin();
+         it != history.rend() &&
+         records.size() < static_cast<size_t>(history_context_commits_);
+         ++it) {
+      if (!it->text.empty())
+        records.push_back(it->text);
+    }
   }
 
   string result;
   for (auto it = records.rbegin(); it != records.rend(); ++it)
     result += *it;
+
+  const Composition& composition = context->composition();
+  if (composition.empty())
+    return result;
+  const size_t active_start = composition.back().start;
+  for (const Segment& segment : composition) {
+    if (segment.end > active_start)
+      continue;
+    if (segment.status < Segment::kSelected)
+      continue;
+    if (auto cand = segment.GetSelectedCandidate()) {
+      result += cand->text();
+    } else if (!segment.HasTag("phony") &&
+               segment.end <= composition.input().size()) {
+      result +=
+          composition.input().substr(segment.start, segment.end - segment.start);
+    }
+  }
   return result;
 }
 
