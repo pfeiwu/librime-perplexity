@@ -1,7 +1,4 @@
-//
-// Copyright RIME Developers
-// Distributed under the BSD License
-//
+// SPDX-License-Identifier: BSD-3-Clause
 
 #include <rime/component.h>
 #include <rime/registry.h>

@@ -1,7 +1,4 @@
-//
-// Copyright RIME Developers
-// Distributed under the BSD License
-//
+// SPDX-License-Identifier: BSD-3-Clause
 
 #ifndef RIME_PERPLEXITY_SCORER_H_
 #define RIME_PERPLEXITY_SCORER_H_
