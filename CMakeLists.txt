@@ -208,20 +208,47 @@ if(NOT BUILD_MERGED_PLUGINS AND perplexity_runtime_deps)
       FILES ${perplexity_runtime_install_files})
   ")
 
-  if(CMAKE_VERSION VERSION_GREATER_EQUAL 3.19)
-    if(APPLE)
-      set(perplexity_install_rpath "@loader_path/perplexity")
-    else()
-      set(perplexity_install_rpath "$ORIGIN/perplexity")
-    endif()
-    get_filename_component(perplexity_plugins_binary_dir
-      "${CMAKE_CURRENT_BINARY_DIR}" DIRECTORY)
-    cmake_language(DEFER DIRECTORY "${perplexity_plugins_binary_dir}"
-      CALL set_target_properties rime-perplexity
-      PROPERTIES INSTALL_RPATH "${perplexity_install_rpath}")
-  else()
-    message(WARNING
-      "perplexity: CMake 3.19 or newer is required to set install RPATH "
-      "for bundled runtime libraries")
+  set(perplexity_installed_plugin
+    "${CMAKE_INSTALL_FULL_LIBDIR}/${RIME_PLUGINS_DIR}/${CMAKE_SHARED_LIBRARY_PREFIX}rime-perplexity${CMAKE_SHARED_LIBRARY_SUFFIX}")
+  if(APPLE)
+    set(perplexity_install_rpath "@loader_path/perplexity")
+    install(CODE "
+      set(plugin_file \"\$ENV{DESTDIR}${perplexity_installed_plugin}\")
+      if(EXISTS \"\${plugin_file}\")
+        execute_process(
+          COMMAND \"${CMAKE_INSTALL_NAME_TOOL}\" -delete_rpath
+                  \"${perplexity_install_rpath}\" \"\${plugin_file}\"
+          ERROR_QUIET)
+        execute_process(
+          COMMAND \"${CMAKE_INSTALL_NAME_TOOL}\" -add_rpath
+                  \"${perplexity_install_rpath}\" \"\${plugin_file}\"
+          RESULT_VARIABLE rpath_result)
+        if(NOT rpath_result EQUAL 0)
+          message(FATAL_ERROR
+            \"perplexity: failed to set install rpath on \${plugin_file}\")
+        endif()
+      endif()
+    ")
+  elseif(UNIX)
+    set(perplexity_install_rpath "$ORIGIN/perplexity")
+    install(CODE "
+      set(plugin_file \"\$ENV{DESTDIR}${perplexity_installed_plugin}\")
+      if(EXISTS \"\${plugin_file}\")
+        find_program(PATCHELF_EXECUTABLE patchelf)
+        if(PATCHELF_EXECUTABLE)
+          execute_process(
+            COMMAND \"\${PATCHELF_EXECUTABLE}\" --set-rpath
+                    \"${perplexity_install_rpath}\" \"\${plugin_file}\"
+            RESULT_VARIABLE rpath_result)
+          if(NOT rpath_result EQUAL 0)
+            message(FATAL_ERROR
+              \"perplexity: failed to set install rpath on \${plugin_file}\")
+          endif()
+        else()
+          message(WARNING
+            \"perplexity: patchelf not found; installed plugin may not find bundled runtime libraries\")
+        endif()
+      endif()
+    ")
   endif()
 endif()
