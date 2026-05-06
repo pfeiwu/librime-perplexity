@@ -51,6 +51,37 @@ GPU backends require their toolchain to be installed (CUDA Toolkit, Vulkan
 SDK, ROCm) — this is on you, the action script just passes the right
 `-DGGML_*=ON` flag to llama.cpp.
 
+## Install
+
+### Linux
+
+Install into the system librime plugin directory:
+
+```bash
+cd /path/to/librime
+make install
+sudo install -m 755 dist/lib/rime-plugins/librime-perplexity.so \
+  /usr/lib/rime-plugins/librime-perplexity.so
+sudo mkdir -p /usr/lib/rime-plugins/perplexity
+sudo rsync -a dist/lib/rime-plugins/perplexity/ \
+  /usr/lib/rime-plugins/perplexity/
+```
+
+### macOS
+
+Install into Squirrel's bundled librime plugin directory:
+
+```bash
+cd /path/to/librime
+make install
+sudo install -m 755 dist/lib/rime-plugins/librime-perplexity.dylib \
+  "/Library/Input Methods/Squirrel.app/Contents/Frameworks/rime-plugins/librime-perplexity.dylib"
+sudo mkdir -p \
+  "/Library/Input Methods/Squirrel.app/Contents/Frameworks/rime-plugins/perplexity"
+sudo rsync -a dist/lib/rime-plugins/perplexity/ \
+  "/Library/Input Methods/Squirrel.app/Contents/Frameworks/rime-plugins/perplexity/"
+```
+
 ## Models
 
 ### Causal LM
