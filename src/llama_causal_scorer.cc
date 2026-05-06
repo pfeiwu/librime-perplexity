@@ -253,6 +253,10 @@ class LlamaCausalScorer : public PerplexityScorer {
     if (prefix_cache_capacity_ > 0)
       return ScoreTokensWithCache(input);
 
+    return ScoreTokensUncached(input);
+  }
+
+  double ScoreTokensUncached(const TokenizedInput& input) {
     const auto& tokens = input.tokens;
 
     llama_memory_clear(llama_get_memory(context_), true);
@@ -300,6 +304,15 @@ class LlamaCausalScorer : public PerplexityScorer {
       return;
     }
 
+    ScoreTokenBatchUncached(tokenized, start, end, scores,
+                            /*clear_after=*/false);
+  }
+
+  void ScoreTokenBatchUncached(const vector<TokenizedInput>& tokenized,
+                               size_t start,
+                               size_t end,
+                               vector<PerplexityScore>* scores,
+                               bool clear_after) {
     llama_memory_clear(llama_get_memory(context_), true);
 
     int total_tokens = 0;
@@ -329,8 +342,10 @@ class LlamaCausalScorer : public PerplexityScorer {
       llama_batch_free(batch);
       for (size_t i = start; i < end; ++i) {
         if (!tokenized[i].tokens.empty())
-          (*scores)[i].average_logprob = ScoreTokens(tokenized[i]);
+          (*scores)[i].average_logprob = ScoreTokensUncached(tokenized[i]);
       }
+      if (clear_after)
+        ClearCacheState();
       return;
     }
 
@@ -357,6 +372,8 @@ class LlamaCausalScorer : public PerplexityScorer {
                           : -std::numeric_limits<double>::infinity();
     }
     llama_batch_free(batch);
+    if (clear_after)
+      ClearCacheState();
   }
 
   double ScoreTokensWithCache(const TokenizedInput& input) {
@@ -408,13 +425,16 @@ class LlamaCausalScorer : public PerplexityScorer {
           continue;
         }
 
-        const auto& cached = prefix_cache_[match.cache_index];
+        const auto cached = prefix_cache_[match.cache_index];
         plan.decode_start = std::max(0, plan.matched_len - 1);
         plan.cached_logprob_sum =
             PrefixLogprobSum(cached, static_cast<size_t>(plan.matched_len));
         plan.cached_token_count = std::max(0, plan.matched_len - 1);
         plan.cached_prefix_sums = cached.prefix_logprob_sums;
-        plan.seq_id = AllocSeqId();
+        plan.seq_id = AllocSeqId(cached.seq_id);
+        if (plan.seq_id < 0)
+          return ScoreTokenBatchFallback(tokenized, start, end, scores);
+        llama_memory_seq_rm(llama_get_memory(context_), plan.seq_id, -1, -1);
         if (plan.decode_start > 0) {
           llama_memory_seq_cp(llama_get_memory(context_), cached.seq_id,
                               plan.seq_id, 0, plan.decode_start);
@@ -422,11 +442,9 @@ class LlamaCausalScorer : public PerplexityScorer {
       } else {
         plan.decode_start = 0;
         plan.seq_id = AllocSeqId();
-      }
-      if (plan.seq_id < 0) {
-        (*scores)[i].average_logprob =
-            ScoreTokensWithoutCache({tokens, plan.score_start});
-        continue;
+        if (plan.seq_id < 0)
+          return ScoreTokenBatchFallback(tokenized, start, end, scores);
+        llama_memory_seq_rm(llama_get_memory(context_), plan.seq_id, -1, -1);
       }
 
       total_decode_tokens +=
@@ -458,14 +476,7 @@ class LlamaCausalScorer : public PerplexityScorer {
 
     if (llama_decode(context_, batch) != 0) {
       llama_batch_free(batch);
-      for (const auto& plan : plans) {
-        if (plan.full_cache_hit)
-          continue;
-        llama_memory_seq_rm(llama_get_memory(context_), plan.seq_id, -1, -1);
-        (*scores)[plan.candidate_index].average_logprob =
-            ScoreTokensWithoutCache({*plan.tokens, plan.score_start});
-      }
-      return;
+      return ScoreTokenBatchFallback(tokenized, start, end, scores);
     }
 
     const float* logits = llama_get_logits(context_);
@@ -519,12 +530,22 @@ class LlamaCausalScorer : public PerplexityScorer {
   double ScoreTokensWithoutCache(const TokenizedInput& input) {
     const int saved_capacity = prefix_cache_capacity_;
     prefix_cache_capacity_ = 0;
-    const double score = ScoreTokens(input);
-    llama_memory_clear(llama_get_memory(context_), true);
-    prefix_cache_.clear();
-    ResetSeqIds();
+    const double score = ScoreTokensUncached(input);
     prefix_cache_capacity_ = saved_capacity;
+    ClearCacheState();
     return score;
+  }
+
+  void ScoreTokenBatchFallback(const vector<TokenizedInput>& tokenized,
+                               size_t start,
+                               size_t end,
+                               vector<PerplexityScore>* scores) {
+    const int saved_capacity = prefix_cache_capacity_;
+    prefix_cache_capacity_ = 0;
+    ScoreTokenBatchUncached(tokenized, start, end, scores,
+                            /*clear_after=*/false);
+    prefix_cache_capacity_ = saved_capacity;
+    ClearCacheState();
   }
 
   PrefixMatch FindLongestPrefix(const vector<llama_token>& tokens) const {
@@ -555,28 +576,34 @@ class LlamaCausalScorer : public PerplexityScorer {
     prefix_cache_[cache_index].last_used = ++access_counter_;
   }
 
+  bool EvictOnePrefix(llama_seq_id protected_seq_id = -1) {
+    auto victim = prefix_cache_.end();
+    for (auto it = prefix_cache_.begin(); it != prefix_cache_.end(); ++it) {
+      if (it->seq_id == protected_seq_id)
+        continue;
+      if (victim == prefix_cache_.end() ||
+          it->last_used < victim->last_used) {
+        victim = it;
+      }
+    }
+    if (victim == prefix_cache_.end())
+      return false;
+    Evict(victim);
+    return true;
+  }
+
   void EvictLRUIfNeeded() {
     if (prefix_cache_capacity_ <= 0 ||
         prefix_cache_.size() < static_cast<size_t>(prefix_cache_capacity_)) {
       return;
     }
-    auto victim = std::min_element(
-        prefix_cache_.begin(), prefix_cache_.end(),
-        [](const CachedPrefix& a, const CachedPrefix& b) {
-          return a.last_used < b.last_used;
-        });
-    Evict(victim);
+    EvictOnePrefix();
   }
 
   void EvictUntilTokenCapacity(int decode_tokens) {
     while (!prefix_cache_.empty() &&
            CachedTokenCount() + decode_tokens > n_ctx_) {
-      auto victim = std::min_element(
-          prefix_cache_.begin(), prefix_cache_.end(),
-          [](const CachedPrefix& a, const CachedPrefix& b) {
-            return a.last_used < b.last_used;
-          });
-      Evict(victim);
+      EvictOnePrefix();
     }
   }
 
@@ -593,14 +620,9 @@ class LlamaCausalScorer : public PerplexityScorer {
     prefix_cache_.erase(victim);
   }
 
-  llama_seq_id AllocSeqId() {
+  llama_seq_id AllocSeqId(llama_seq_id protected_seq_id = -1) {
     if (free_seq_ids_.empty())
-      EvictLRUIfNeeded();
-    if (free_seq_ids_.empty()) {
-      llama_memory_clear(llama_get_memory(context_), true);
-      prefix_cache_.clear();
-      ResetSeqIds();
-    }
+      EvictOnePrefix(protected_seq_id);
     if (free_seq_ids_.empty())
       return -1;
     llama_seq_id seq_id = free_seq_ids_.back();
@@ -614,6 +636,12 @@ class LlamaCausalScorer : public PerplexityScorer {
     free_seq_ids_.reserve(static_cast<size_t>(n_seq));
     for (int i = n_seq - 1; i >= 0; --i)
       free_seq_ids_.push_back(static_cast<llama_seq_id>(i));
+  }
+
+  void ClearCacheState() {
+    llama_memory_clear(llama_get_memory(context_), true);
+    prefix_cache_.clear();
+    ResetSeqIds();
   }
 
   void InsertOrReplacePrefix(llama_seq_id seq_id,
