@@ -11,7 +11,7 @@
 # Knobs (env vars):
 #   PERPLEXITY_LLAMA_BACKEND   cpu|metal|cuda|vulkan|hip   (default: metal on macOS, cpu elsewhere)
 #   PERPLEXITY_ORT_BACKEND     cpu|cuda                    (default: cpu)
-#   PERPLEXITY_LLAMA_REPO      git URL                     (default: upstream ggerganov/llama.cpp)
+#   PERPLEXITY_LLAMA_REPO      git URL                     (default: upstream ggml-org/llama.cpp)
 #   PERPLEXITY_LLAMA_REF       branch / tag                (default: master)
 #   PERPLEXITY_ORT_VERSION     onnxruntime release version (default: 1.20.1)
 
@@ -39,7 +39,7 @@ if [[ -z "${PERPLEXITY_LLAMA_BACKEND:-}" ]]; then
 fi
 PERPLEXITY_ORT_BACKEND="${PERPLEXITY_ORT_BACKEND:-cpu}"
 
-llama_repo="${PERPLEXITY_LLAMA_REPO:-https://github.com/ggerganov/llama.cpp.git}"
+llama_repo="${PERPLEXITY_LLAMA_REPO:-https://github.com/ggml-org/llama.cpp.git}"
 llama_ref="${PERPLEXITY_LLAMA_REF:-master}"
 ort_version="${PERPLEXITY_ORT_VERSION:-1.20.1}"
 

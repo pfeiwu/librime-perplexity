@@ -1,18 +1,13 @@
 # librime-perplexity
 
-Experimental Rime filter for reranking sentence candidates with local language
-model perplexity.
+Experimental Rime plugin providing a perplexity-based filter for reranking
+candidates with a local language model.
 
 WIP, mostly vibe-coded. Use at your own risk.
 
-This plugin needs multiple sentence candidates from librime. Current stable
-librime only outputs one sentence candidate, making this plugin mostly
-meaningless; the needed support is in librime commit `9422ca7`
-([PR #1164](https://github.com/rime/librime/pull/1164)).
-
 ## Requirements
 
-- librime after commit `9422ca7`, built with external plugin support.
+- librime built with external plugin support.
 - At least one scorer backend:
   - causal LM: llama.cpp headers/shared libraries + a GGUF model.
   - masked LM: ONNX Runtime headers/shared libraries + a BERT-style ONNX
@@ -20,17 +15,13 @@ meaningless; the needed support is in librime commit `9422ca7`
 
 ## Build
 
-From the librime root, run the plugin's `action-install.sh` via librime's
-`install-plugins.sh`. It clones llama.cpp into
-`plugins/perplexity/thirdparty/llama.cpp` (and builds it), downloads a
-prebuilt ONNX Runtime tarball into `plugins/perplexity/thirdparty/onnxruntime`,
-and the plugin's CMake auto-discovers both.
+Install the plugin from the librime root with `install-plugins.sh`. The action
+script prepares llama.cpp and ONNX Runtime under `plugins/perplexity/thirdparty`,
+where the plugin's CMake auto-discovers them.
 
 ```bash
-cd librime
-make deps
+cd /path/to/librime
 bash install-plugins.sh run=plugins/perplexity/action-install.sh pfeiwu/librime-perplexity
-make
 ```
 
 Defaults: macOS gets Metal automatically; Linux / Windows build CPU
@@ -43,7 +34,7 @@ To pick a different backend, set environment variables before running
 | ------------------------- | ------------------------------------------- | --------------------------------- |
 | `PERPLEXITY_LLAMA_BACKEND` | `cpu`, `metal`, `cuda`, `vulkan`, `hip`     | `metal` on macOS, `cpu` elsewhere |
 | `PERPLEXITY_ORT_BACKEND`   | `cpu`, `cuda`                               | `cpu`                             |
-| `PERPLEXITY_LLAMA_REPO`    | git URL                                     | upstream `ggerganov/llama.cpp`    |
+| `PERPLEXITY_LLAMA_REPO`    | git URL                                     | upstream `ggml-org/llama.cpp`     |
 | `PERPLEXITY_LLAMA_REF`     | branch or tag                               | `master`                          |
 | `PERPLEXITY_ORT_VERSION`   | release version                             | `1.20.1`                          |
 
@@ -182,6 +173,8 @@ Check Rime logs for `perplexity: loaded causal LM`.
 
 ## Notes
 
+- Reranking multiple sentence candidates requires librime commit `9422ca7` or
+  newer ([PR #1164](https://github.com/rime/librime/pull/1164)).
 - For masked GPU, check the log for `ep=CUDA` / `ep=CoreML` / `ep=DirectML`.
   ONNX Runtime GPU builds are tied to specific CUDA versions.
 - For causal cache, keep `batch_size + cache_size` within the model's
