@@ -10,6 +10,9 @@
 #include <cmath>
 #include <limits>
 #include <numeric>
+#include <opencc/Config.hpp>
+#include <opencc/Converter.hpp>
+#include <opencc/Exception.hpp>
 #include <rime/candidate.h>
 #include <rime/commit_history.h>
 #include <rime/config.h>
@@ -22,6 +25,31 @@
 #include <rime/gear/translator_commons.h>
 
 namespace rime {
+
+class ScoreTextConverter {
+ public:
+  ScoreTextConverter(const string& config_name, const path& config_path)
+      : config_name_(config_name) {
+    opencc::Config config;
+    converter_ = config.NewFromFile(config_path.u8string());
+    LOG(INFO) << "perplexity: score OpenCC config=" << config_name_
+              << " path=" << config_path;
+  }
+
+  bool Ready() const { return static_cast<bool>(converter_); }
+
+  string Convert(const string& text) const {
+    if (!converter_ || text.empty())
+      return text;
+    return converter_->Convert(text);
+  }
+
+  const string& config_name() const { return config_name_; }
+
+ private:
+  string config_name_;
+  opencc::ConverterPtr converter_;
+};
 
 namespace {
 
@@ -176,6 +204,22 @@ static an<Translation> TranslationFromCandidates(
   return prefix;
 }
 
+static path ResolveOpenccConfigPath(const string& opencc_config) {
+  path opencc_config_path(opencc_config);
+  if (opencc_config_path.is_relative()) {
+    path user_config_path = Service::instance().deployer().user_data_dir;
+    path shared_config_path = Service::instance().deployer().shared_data_dir;
+    (user_config_path /= "opencc") /= opencc_config_path;
+    (shared_config_path /= "opencc") /= opencc_config_path;
+    if (std::filesystem::exists(user_config_path)) {
+      opencc_config_path = user_config_path;
+    } else if (std::filesystem::exists(shared_config_path)) {
+      opencc_config_path = shared_config_path;
+    }
+  }
+  return opencc_config_path;
+}
+
 static std::unique_ptr<PerplexityScorer> CreateScorer(Config* config,
                                                       const string& ns) {
   PerplexityScorerOptions options;
@@ -220,6 +264,23 @@ PerplexityRanker::PerplexityRanker(const Ticket& ticket)
     config->GetInt(name_space_ + "/history_context_commits",
                    &history_context_commits_);
     config->GetDouble(name_space_ + "/score_weight", &score_weight_);
+    string opencc_config;
+    config->GetString(name_space_ + "/opencc_config", &opencc_config);
+    if (!opencc_config.empty()) {
+      if (path(opencc_config).extension().u8string() == ".ini") {
+        LOG(ERROR)
+            << "perplexity: please use an OpenCC 1.0 JSON config file: "
+            << opencc_config;
+      } else {
+        try {
+          score_text_converter_ = std::make_unique<ScoreTextConverter>(
+              opencc_config, ResolveOpenccConfigPath(opencc_config));
+        } catch (const opencc::Exception& e) {
+          LOG(ERROR) << "perplexity: failed to initialize score OpenCC config "
+                     << opencc_config << ": " << e.what();
+        }
+      }
+    }
     if (auto types = config->GetList(name_space_ + "/rank_types")) {
       for (auto it = types->begin(); it != types->end(); ++it) {
         if (auto value = As<ConfigValue>(*it)) {
@@ -238,6 +299,8 @@ PerplexityRanker::PerplexityRanker(const Ticket& ticket)
   history_context_commits_ = std::max(0, history_context_commits_);
   score_weight_ = std::max(0.0, std::min(1.0, score_weight_));
 }
+
+PerplexityRanker::~PerplexityRanker() = default;
 
 bool PerplexityRanker::AppliesToSegment(Segment* segment) {
   return TagsMatch(segment);
@@ -308,6 +371,24 @@ string PerplexityRanker::BuildHistoryContext() const {
   return result;
 }
 
+string PerplexityRanker::ConvertForScoring(const string& text) const {
+  if (!score_text_converter_ || !score_text_converter_->Ready())
+    return text;
+  return score_text_converter_->Convert(text);
+}
+
+vector<string> PerplexityRanker::ConvertUnitsForScoring(
+    const vector<string>& units) const {
+  if (!score_text_converter_ || !score_text_converter_->Ready())
+    return units;
+  vector<string> converted;
+  converted.reserve(units.size());
+  for (const auto& unit : units) {
+    converted.push_back(score_text_converter_->Convert(unit));
+  }
+  return converted;
+}
+
 an<Translation> PerplexityRanker::Apply(an<Translation> translation,
                                         CandidateList* candidates) {
   if (!translation || translation->exhausted())
@@ -358,10 +439,13 @@ an<Translation> PerplexityRanker::Apply(an<Translation> translation,
   }
 
   const string history_context = BuildHistoryContext();
+  const string scoring_history_context = ConvertForScoring(history_context);
   vector<PerplexityInput> inputs;
   inputs.reserve(rankable.size());
   for (const auto& cand : rankable) {
-    inputs.push_back({history_context, cand->text(), GetCandidateUnits(cand)});
+    vector<string> units = GetCandidateUnits(cand);
+    inputs.push_back({scoring_history_context, ConvertForScoring(cand->text()),
+                      ConvertUnitsForScoring(units)});
   }
 
   const auto start = std::chrono::steady_clock::now();
@@ -375,8 +459,12 @@ an<Translation> PerplexityRanker::Apply(an<Translation> translation,
             << " input_size=" << CurrentInputSize()
             << " min_input_size=" << min_input_size_
             << " score_weight=" << score_weight_
+            << " opencc_config="
+            << (score_text_converter_ ? score_text_converter_->config_name()
+                                      : string())
             << " history_context_commits=" << history_context_commits_
             << " history_context_chars=" << history_context.size()
+            << " scoring_context_chars=" << scoring_history_context.size()
             << " scoring=" << elapsed_ms << "ms";
 
   const vector<RankScore> rank_scores =
@@ -412,6 +500,7 @@ an<Translation> PerplexityRanker::Apply(an<Translation> translation,
               << " input_size=" << GetCandidateInputSize(rankable[index])
               << " type=" << (genuine ? genuine->type() : string())
               << " outer_type=" << rankable[index]->type()
+              << " scoring_text=" << inputs[index].text
               << " text=" << rankable[index]->text();
   }
 

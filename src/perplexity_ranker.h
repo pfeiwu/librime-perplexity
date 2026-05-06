@@ -18,6 +18,7 @@ namespace rime {
 class PerplexityRanker : public Filter, public TagMatching {
  public:
   explicit PerplexityRanker(const Ticket& ticket);
+  ~PerplexityRanker() override;
 
   an<Translation> Apply(an<Translation> translation,
                         CandidateList* candidates) override;
@@ -27,6 +28,8 @@ class PerplexityRanker : public Filter, public TagMatching {
   bool IsRankableCandidate(const an<Candidate>& cand) const;
   size_t CurrentInputSize() const;
   string BuildHistoryContext() const;
+  string ConvertForScoring(const string& text) const;
+  vector<string> ConvertUnitsForScoring(const vector<string>& units) const;
 
   int top_k_ = 0;
   int scan_size_ = 50;
@@ -36,6 +39,7 @@ class PerplexityRanker : public Filter, public TagMatching {
   double score_weight_ = 1.0;
   hash_set<string> rank_types_;
   std::unique_ptr<PerplexityScorer> scorer_;
+  std::unique_ptr<class ScoreTextConverter> score_text_converter_;
 };
 
 }  // namespace rime
