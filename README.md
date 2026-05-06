@@ -20,40 +20,36 @@ meaningless; the needed support is in librime commit `9422ca7`
 
 ## Build
 
-Build llama.cpp first if you do not already have it:
+From the librime root, run the plugin's `action-install.sh` via librime's
+`install-plugins.sh`. It clones llama.cpp into
+`plugins/perplexity/thirdparty/llama.cpp` (and builds it), downloads a
+prebuilt ONNX Runtime tarball into `plugins/perplexity/thirdparty/onnxruntime`,
+and the plugin's CMake auto-discovers both.
 
 ```bash
-cmake -S /path/to/llama.cpp -B /path/to/llama.cpp/build -DBUILD_SHARED_LIBS=ON
-cmake --build /path/to/llama.cpp/build
+cd librime
+make deps
+bash install-plugins.sh run=plugins/perplexity/action-install.sh pfeiwu/librime-perplexity
+make
 ```
 
-For GPU acceleration, add the llama.cpp backend option you need, such as
-`-DGGML_CUDA=ON`, `-DGGML_VULKAN=ON`, or `-DGGML_METAL=ON`.
+Defaults: macOS gets Metal automatically; Linux / Windows build CPU
+llama.cpp; ONNX Runtime is the prebuilt CPU tarball on all platforms.
 
-Build this plugin in-tree with librime:
+To pick a different backend, set environment variables before running
+`install-plugins.sh`:
 
-```text
-librime/plugins/perplexity
-```
+| Variable                  | Values                                      | Default                           |
+| ------------------------- | ------------------------------------------- | --------------------------------- |
+| `PERPLEXITY_LLAMA_BACKEND` | `cpu`, `metal`, `cuda`, `vulkan`, `hip`     | `metal` on macOS, `cpu` elsewhere |
+| `PERPLEXITY_ORT_BACKEND`   | `cpu`, `cuda`                               | `cpu`                             |
+| `PERPLEXITY_LLAMA_REPO`    | git URL                                     | upstream `ggerganov/llama.cpp`    |
+| `PERPLEXITY_LLAMA_REF`     | branch or tag                               | `master`                          |
+| `PERPLEXITY_ORT_VERSION`   | release version                             | `1.20.1`                          |
 
-```bash
-cmake -S . -B build \
-  -DENABLE_EXTERNAL_PLUGINS=ON \
-  -DBUILD_MERGED_PLUGINS=OFF \
-  -DPERPLEXITY_LLAMA_CPP_DIR=/path/to/llama.cpp \
-  -DPERPLEXITY_LLAMA_CPP_BUILD_DIR=/path/to/llama.cpp/build \
-  -DPERPLEXITY_ONNXRUNTIME_DIR=/path/to/onnxruntime
-
-cmake --build build --target rime-perplexity
-```
-
-Install `librime-perplexity.{so,dylib,dll}` to your librime plugin directory.
-The plugin is dynamically linked to its selected backend libraries, so
-llama.cpp/ggml or ONNX Runtime libraries must also be discoverable by the
-runtime loader.
-
-`PERPLEXITY_LLAMA_CPP_*` is only needed for `model_type: causal`.
-`PERPLEXITY_ONNXRUNTIME_DIR` is only needed for `model_type: masked`.
+GPU backends require their toolchain to be installed (CUDA Toolkit, Vulkan
+SDK, ROCm) — this is on you, the action script just passes the right
+`-DGGML_*=ON` flag to llama.cpp.
 
 ## Models
 
@@ -155,8 +151,6 @@ Check Rime logs for `perplexity: loaded causal LM`.
 
 ## Notes
 
-- Check the generated schema after deploy; `*.custom.yaml` alone is not proof
-  that Rime loaded the intended config.
 - For masked GPU, check the log for `ep=CUDA` / `ep=CoreML` / `ep=DirectML`.
   ONNX Runtime GPU builds are tied to specific CUDA versions.
 - For causal cache, keep `batch_size + cache_size` within the model's
