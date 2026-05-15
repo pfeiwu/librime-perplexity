@@ -169,7 +169,8 @@ perplexity:
 | `perplexity/top_k` | `0` | Output cap for reranked candidates kept in rankable slots; `0` keeps all rankable candidates collected by `rank_size`. |
 | `perplexity/history_context_commits` | `0` | Recent commit-history records used as scoring context. |
 
-Check Rime logs for `perplexity: loaded causal LM`.
+Check Rime logs for `perplexity: loaded new cached causal LM` and
+`perplexity: reusing cached causal LM`.
 
 ## Notes
 
@@ -179,3 +180,6 @@ Check Rime logs for `perplexity: loaded causal LM`.
   ONNX Runtime GPU builds are tied to specific CUDA versions.
 - For causal cache, keep `batch_size + cache_size` within the model's
   llama.cpp sequence limit.
+- Multiple causal ranker filter instances with the same model path and
+  `gpu_layers` share one loaded llama model in the process. Each instance
+  still owns its own mutable llama context and prefix KV cache.

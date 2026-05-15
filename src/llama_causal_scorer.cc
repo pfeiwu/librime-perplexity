@@ -5,7 +5,10 @@
 #include <algorithm>
 #include <cmath>
 #include <exception>
+#include <filesystem>
 #include <limits>
+#include <mutex>
+#include <system_error>
 
 #ifdef RIME_PERPLEXITY_ENABLE_LLAMA
 #include <ggml-backend.h>
@@ -68,6 +71,87 @@ static ggml_backend_dev_t LoadBackendsForGpuLayers(int gpu_layers) {
   return cpu_dev;
 }
 
+struct SharedLlamaModel {
+  ~SharedLlamaModel() {
+    if (model)
+      llama_model_free(model);
+  }
+
+  llama_model* model = nullptr;
+  const llama_vocab* vocab = nullptr;
+  int n_vocab = 0;
+  string model_path;
+  int gpu_layers = 0;
+};
+
+struct LlamaModelCacheKey {
+  string model_path;
+  int gpu_layers = 0;
+
+  bool operator<(const LlamaModelCacheKey& other) const {
+    return std::tie(model_path, gpu_layers) <
+           std::tie(other.model_path, other.gpu_layers);
+  }
+};
+
+static string CanonicalModelPath(const string& model_path) {
+  std::error_code ec;
+  auto canonical = std::filesystem::weakly_canonical(
+      std::filesystem::path(model_path), ec);
+  if (!ec)
+    return canonical.u8string();
+  return model_path;
+}
+
+static std::shared_ptr<SharedLlamaModel> GetOrLoadLlamaModel(
+    const string& model_path,
+    int gpu_layers) {
+  static std::mutex mutex;
+  static map<LlamaModelCacheKey, std::weak_ptr<SharedLlamaModel>> cache;
+
+  const LlamaModelCacheKey key{CanonicalModelPath(model_path), gpu_layers};
+  std::lock_guard<std::mutex> lock(mutex);
+
+  auto it = cache.find(key);
+  if (it != cache.end()) {
+    if (auto model = it->second.lock()) {
+      LOG(INFO) << "perplexity: reusing cached causal LM: "
+                << key.model_path << ", gpu_layers=" << key.gpu_layers
+                << ", active_refs=" << model.use_count();
+      return model;
+    }
+    cache.erase(it);
+  }
+
+  ggml_backend_dev_t cpu_dev = LoadBackendsForGpuLayers(gpu_layers);
+
+  llama_model_params model_params = llama_model_default_params();
+  model_params.n_gpu_layers = gpu_layers;
+  ggml_backend_dev_t cpu_devices[] = {cpu_dev, nullptr};
+  if (cpu_dev) {
+    model_params.devices = cpu_devices;
+  }
+
+  std::shared_ptr<SharedLlamaModel> model =
+      std::make_shared<SharedLlamaModel>();
+  model->model = llama_model_load_from_file(key.model_path.c_str(),
+                                            model_params);
+  if (!model->model) {
+    LOG(ERROR) << "perplexity: failed to load causal LM: " << key.model_path;
+    return nullptr;
+  }
+  model->vocab = llama_model_get_vocab(model->model);
+  model->n_vocab = llama_vocab_n_tokens(model->vocab);
+  model->model_path = key.model_path;
+  model->gpu_layers = key.gpu_layers;
+  cache[key] = model;
+
+  LOG(INFO) << "perplexity: loaded new cached causal LM: "
+            << key.model_path << ", gpu_layers=" << key.gpu_layers
+            << ", active_refs=" << model.use_count();
+  return model;
+}
+
 class LlamaCausalScorer : public PerplexityScorer {
  public:
   explicit LlamaCausalScorer(const PerplexityScorerOptions& options)
@@ -76,25 +160,14 @@ class LlamaCausalScorer : public PerplexityScorer {
         unknown_token_penalty_(std::max(0.0, options.unknown_token_penalty)),
         score_prefix_(options.score_prefix),
         score_suffix_(options.score_suffix) {
-    ggml_backend_dev_t cpu_dev =
-        LoadBackendsForGpuLayers(options.gpu_layers);
-
-    llama_model_params model_params = llama_model_default_params();
-    model_params.n_gpu_layers = options.gpu_layers;
-    ggml_backend_dev_t cpu_devices[] = {cpu_dev, nullptr};
-    if (cpu_dev) {
-      model_params.devices = cpu_devices;
-    }
-    model_ =
-        llama_model_load_from_file(options.model_path.c_str(), model_params);
-    if (!model_) {
-      LOG(ERROR) << "perplexity: failed to load causal LM: "
-                 << options.model_path;
+    shared_model_ = GetOrLoadLlamaModel(options.model_path,
+                                        options.gpu_layers);
+    if (!shared_model_) {
       return;
     }
 
-    vocab_ = llama_model_get_vocab(model_);
-    n_vocab_ = llama_vocab_n_tokens(vocab_);
+    vocab_ = shared_model_->vocab;
+    n_vocab_ = shared_model_->n_vocab;
 
     llama_context_params context_params = llama_context_default_params();
     context_params.n_ctx = std::max(256, options.max_length);
@@ -105,18 +178,21 @@ class LlamaCausalScorer : public PerplexityScorer {
     context_params.kv_unified = true;
     context_params.no_perf = true;
 
-    context_ = llama_init_from_model(model_, context_params);
+    context_ = llama_init_from_model(shared_model_->model, context_params);
     if (!context_) {
       LOG(ERROR) << "perplexity: failed to create causal LM context";
-      llama_model_free(model_);
-      model_ = nullptr;
+      shared_model_.reset();
+      vocab_ = nullptr;
+      n_vocab_ = 0;
       return;
     }
     ResetSeqIds();
-    LOG(INFO) << "perplexity: loaded causal LM: " << options.model_path
+    LOG(INFO) << "perplexity: initialized causal LM context: "
+              << shared_model_->model_path
               << ", gpu_layers=" << options.gpu_layers
               << ", batch_size=" << max_parallel_
               << ", cache_size=" << prefix_cache_capacity_
+              << ", shared_model_refs=" << shared_model_.use_count()
               << (prefix_cache_capacity_ > 0
                       ? " (prefix KV cache enabled, scores not "
                         "bit-identical to uncached baseline)"
@@ -127,11 +203,9 @@ class LlamaCausalScorer : public PerplexityScorer {
   ~LlamaCausalScorer() override {
     if (context_)
       llama_free(context_);
-    if (model_)
-      llama_model_free(model_);
   }
 
-  bool Ready() const override { return model_ && context_ && vocab_; }
+  bool Ready() const override { return shared_model_ && context_ && vocab_; }
 
   vector<PerplexityScore> Score(
       const vector<PerplexityInput>& inputs) override {
@@ -770,7 +844,7 @@ class LlamaCausalScorer : public PerplexityScorer {
     return true;
   }
 
-  llama_model* model_ = nullptr;
+  std::shared_ptr<SharedLlamaModel> shared_model_;
   llama_context* context_ = nullptr;
   const llama_vocab* vocab_ = nullptr;
   int n_vocab_ = 0;

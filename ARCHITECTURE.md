@@ -228,6 +228,11 @@ All parameters apply to both `causal` and `masked` model types unless noted.
 | `perplexity/top_k` | `0` | Output cap for reranked candidates kept in rankable slots; `0` keeps all rankable candidates collected by `rank_size`. |
 | `perplexity/history_context_commits` | `0` | Recent commit-history records used as scoring context. |
 
+For causal GGUF models, filter instances with the same canonical model path
+and `gpu_layers` reuse one process-local `llama_model`. Scorer instances still
+keep separate `llama_context` objects because KV cache and sequence state are
+mutable.
+
 ## Scorer Families
 
 - `causal`: left-to-right LM perplexity.
